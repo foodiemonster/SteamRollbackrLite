@@ -533,6 +533,9 @@ fn build_steam_command(steam_dir: &Path, extra_args: &[&str]) -> Result<(Command
 
 fn set_package_writable(steam_dir: &Path, writable: bool) -> Result<(), String> {
     let pkg = steam_dir.join("package");
+    if !pkg.exists() {
+        return Ok(());
+    }
     let meta = fs::metadata(&pkg).map_err(|e| format!("Failed to stat package/: {e}"))?;
     let mut perms = meta.permissions();
     let mode = perms.mode();
@@ -840,6 +843,8 @@ pub fn read_luatools_moon_fork() -> Option<String> {
 
 pub const SLS64_INSTALL_CMD: &str = "curl -fsSL https://raw.githubusercontent.com/foodiemonster/slssteam-moon-64/main/install-over-luatools.sh | bash && mkdir -p \"$HOME/.cache/steamrollbackr\" && printf moon64 > \"$HOME/.cache/steamrollbackr/sls_variant\" && tag=$(curl -fsSL https://api.github.com/repos/foodiemonster/slssteam-moon-64/releases/latest | grep -m1 '\"tag_name\"' | cut -d'\"' -f4 || true) && ([ -n \"$tag\" ] && printf '%s' \"$tag\" > \"$HOME/.cache/steamrollbackr/sls64_version\" || true)";
 
+pub const SLS32_INSTALL_CMD: &str = "set -euo pipefail; TMP=$(mktemp -d); trap 'rm -rf \"$TMP\"' EXIT; URL=$(curl -fsSL https://api.github.com/repos/swwayps/slsteam-moon/releases/latest | grep -Eo 'https://[^\"]+\\.zip' | head -n 1); curl -fL \"$URL\" -o \"$TMP/sls32.zip\"; unzip -q \"$TMP/sls32.zip\" -d \"$TMP/ext\"; ROOT=$(find \"$TMP/ext\" -maxdepth 2 -name setup.sh -printf '%h\\n' | head -n 1); (cd \"$ROOT\" && ./setup.sh install < /dev/null); mkdir -p \"$HOME/.cache/steamrollbackr\"; printf moon32 > \"$HOME/.cache/steamrollbackr/sls_variant\"; rm -f \"$HOME/.cache/steamrollbackr/sls64_version\"";
+
 /// Reads the user's preferred SLSsteam variant from `~/.cache/steamrollbackr/sls_variant`.
 pub fn read_preferred_sls_variant() -> Option<SlsVariant> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
@@ -1041,15 +1046,10 @@ fn cleanup_and_update_vanilla_steam(
         }
     }
 
-    // Phase 3 & 4: Sanitize Steam installation & run clean vanilla steamrt64 update
+    // Phase 3 & 4: Unlock, sanitize Steam installation & run clean vanilla steamrt64 update
     if let Some(dir) = steam_dir {
         log("Phase 3: Unlocking and sanitizing Steam installation (preserving games & accounts)...");
-        for name in ["Steam.cfg", "steam.cfg"] {
-            let p = dir.join(name);
-            if p.exists() || fs::symlink_metadata(&p).is_ok() {
-                fs::remove_file(&p).map_err(|e| format!("Failed to remove {name}: {e}"))?;
-            }
-        }
+        unlock_updates(dir, log)?;
         sanitize_steam_package_dir(dir, log)?;
 
         log("Phase 4: Running clean vanilla Steam update to steamrt64...");

@@ -265,3 +265,43 @@ pub fn find_best_compatible_release(
         }
     }
 }
+
+/// Extracts a version token (e.g. `"v3.1"` or `"3.1.0"`) from a release title or cached version string.
+pub fn extract_moon_version_token(raw: &str) -> Option<&str> {
+    raw.split_whitespace().rev().find(|tok| {
+        let stripped = tok.trim_start_matches(['v', 'V']);
+        stripped.chars().next().is_some_and(|c| c.is_ascii_digit())
+    })
+}
+
+/// Returns `true` when both `local` and `latest` contain parseable versions and `latest > local`.
+pub fn is_moon_update_available(local: Option<&str>, latest: Option<&str>) -> bool {
+    let (Some(loc), Some(lat)) = (local, latest) else {
+        return false;
+    };
+    let (Some(loc_tok), Some(lat_tok)) = (
+        extract_moon_version_token(loc),
+        extract_moon_version_token(lat),
+    ) else {
+        return false;
+    };
+    crate::updater::is_newer(lat_tok, loc_tok)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_moon_update_available() {
+        assert!(is_moon_update_available(Some("v3.0"), Some("v3.1")));
+        assert!(is_moon_update_available(
+            Some("3.0"),
+            Some("slssteam-moon-64 v3.0.1")
+        ));
+        assert!(!is_moon_update_available(Some("v3.0"), Some("v3.0")));
+        assert!(!is_moon_update_available(Some("v3.1"), Some("v3.0")));
+        assert!(!is_moon_update_available(Some("ELF64"), Some("v3.1")));
+        assert!(!is_moon_update_available(None, Some("v3.1")));
+    }
+}

@@ -4,14 +4,16 @@ use std::thread;
 
 use crate::history::{fetch_manifest_content, fetch_releases, ReleaseEntry};
 use crate::i18n::{draw_flag, texts, Language, Texts};
-use crate::slssteam::{check_slsteam_moon, find_best_compatible_release, SlsMoonStatus};
+use crate::slssteam::{
+    check_slsteam_moon, find_best_compatible_release, is_moon_update_available, SlsMoonStatus,
+};
 use crate::steam::{
     dismiss_64bit_migration, full_uninstall_to_vanilla_steam, inspect_steam,
     inspect_steam_with_override, install_libcrypto3, is_64bit_migration_dismissed,
     is_luatools_linux_installed, lock_only, migrate_to_slssteam_64, restart_steam,
     rollback_to_manifest, run_shell_command, uninstall_libcrypto3, unlock_and_update_steam,
     unlock_updates, ClientVersion, LockState, ManifestChannel, SlsVariant, SteamStatus,
-    SLS64_INSTALL_CMD,
+    SLS32_INSTALL_CMD, SLS64_INSTALL_CMD,
 };
 use crate::updater::{
     check_for_update, detect_install_kind, perform_update, InstallKind, UpdateInfo, UpdateOutcome,
@@ -1949,7 +1951,10 @@ impl SteamRollbackrApp {
                                    name: &str,
                                    link: Option<(&str, &str)>,
                                    version: &str,
-                                   badge: Option<(&str, Color32, Color32)>| {
+                                   action_pill: Option<(&str, &str, bool)>,
+                                   badge: Option<(&str, Color32, Color32)>|
+             -> bool {
+                let mut action_clicked = false;
                 let (row_rect, _) =
                     ui.allocate_exact_size(Vec2::new(avail_w, row_h), egui::Sense::hover());
 
@@ -1989,6 +1994,26 @@ impl SteamRollbackrApp {
                         .layout(egui::Layout::right_to_left(egui::Align::Center)),
                     |ui| {
                         ui.add(egui::Label::new(version).truncate());
+                        if let Some((pill_text, hover_text, enabled)) = action_pill {
+                            ui.add_space(8.0);
+                            let btn = egui::Button::new(
+                                RichText::new(pill_text)
+                                    .small()
+                                    .strong()
+                                    .color(Color32::from_rgb(255, 220, 140)),
+                            )
+                            .fill(Color32::from_rgb(82, 62, 28))
+                            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(168, 124, 52)))
+                            .rounding(Rounding::same(5.0))
+                            .min_size(Vec2::new(0.0, 20.0));
+                            let resp = ui
+                                .add_enabled(enabled, btn)
+                                .on_hover_text(hover_text)
+                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            if resp.clicked() {
+                                action_clicked = true;
+                            }
+                        }
                     },
                 );
 
@@ -2002,6 +2027,7 @@ impl SteamRollbackrApp {
                         }
                     },
                 );
+                action_clicked
             };
 
             // Row 1: Local Steam Client Version (label + full untruncated version on the right)
@@ -2070,13 +2096,41 @@ impl SteamRollbackrApp {
             } else {
                 Some((t.not_found_pill, Color32::from_rgb(54, 54, 58), Color32::GRAY))
             };
-            draw_status_row(
+            let moon_update_latest = self.moon_status.as_ref().and_then(|res| {
+                let st = res.as_ref().ok()?;
+                let latest = st.latest_moon_version.as_deref()?;
+                if is_moon_update_available(Some(moon_ver), Some(latest)) {
+                    Some(latest.to_string())
+                } else {
+                    None
+                }
+            });
+            let moon_update_hover = moon_update_latest
+                .as_deref()
+                .map(|v| format!("{} {v}", t.update_available_hover));
+            let moon_action_pill = moon_update_hover
+                .as_deref()
+                .map(|h| (t.update_available_pill, h, !self.busy));
+            if draw_status_row(
                 ui,
                 active_variant.display_name(),
                 Some((active_variant.repo_url(), t.open_repo_hover)),
                 moon_ver,
+                moon_action_pill,
                 moon_badge,
-            );
+            ) {
+                match active_variant {
+                    SlsVariant::Moon64 => {
+                        self.start_shell_tool("Updating slssteam-moon-64...", SLS64_INSTALL_CMD);
+                    }
+                    SlsVariant::Moon32 => {
+                        self.start_shell_tool(
+                            "Updating slssteam-moon (32-bit)...",
+                            SLS32_INSTALL_CMD,
+                        );
+                    }
+                }
+            }
 
             row_sep(ui);
 
@@ -2099,6 +2153,7 @@ impl SteamRollbackrApp {
                 "LuaTools",
                 Some(("https://github.com/swwayps/luatools-moon", t.open_repo_hover)),
                 luatools_ver,
+                None,
                 luatools_badge,
             );
 
@@ -2123,6 +2178,7 @@ impl SteamRollbackrApp {
                 "Lumen",
                 Some(("https://github.com/swwayps/luatools-moon", t.open_repo_hover)),
                 lumen_ver,
+                None,
                 lumen_badge,
             );
         });
@@ -2795,7 +2851,7 @@ impl SteamRollbackrApp {
                 let sls64_active = installed_variant == Some(SlsVariant::Moon64);
                 let sls32_active = installed_variant == Some(SlsVariant::Moon32);
                 let sls64_cmd = SLS64_INSTALL_CMD;
-                let sls32_cmd = "set -euo pipefail; TMP=$(mktemp -d); trap 'rm -rf \"$TMP\"' EXIT; URL=$(curl -fsSL https://api.github.com/repos/swwayps/slsteam-moon/releases/latest | grep -Eo 'https://[^\"]+\\.zip' | head -n 1); curl -fL \"$URL\" -o \"$TMP/sls32.zip\"; unzip -q \"$TMP/sls32.zip\" -d \"$TMP/ext\"; ROOT=$(find \"$TMP/ext\" -maxdepth 2 -name setup.sh -printf '%h\\n' | head -n 1); (cd \"$ROOT\" && ./setup.sh install < /dev/null); mkdir -p \"$HOME/.cache/steamrollbackr\"; printf moon32 > \"$HOME/.cache/steamrollbackr/sls_variant\"; rm -f \"$HOME/.cache/steamrollbackr/sls64_version\"";
+                let sls32_cmd = SLS32_INSTALL_CMD;
 
                 card_frame().show(ui, |ui| {
                     ui.set_width(ui.available_width());
