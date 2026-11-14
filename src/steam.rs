@@ -51,12 +51,44 @@ impl LockState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlsVariant {
+    Moon32,
+    Moon64,
+}
+
+impl SlsVariant {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            SlsVariant::Moon32 => "slssteam-moon",
+            SlsVariant::Moon64 => "slssteam-moon-64",
+        }
+    }
+
+    pub fn repo_url(self) -> &'static str {
+        match self {
+            SlsVariant::Moon32 => "https://github.com/swwayps/slsteam-moon",
+            SlsVariant::Moon64 => "https://github.com/foodiemonster/slssteam-moon-64",
+        }
+    }
+
+    pub fn from_cache_str(s: &str) -> Option<Self> {
+        match s.trim() {
+            "moon32" => Some(SlsVariant::Moon32),
+            "moon64" => Some(SlsVariant::Moon64),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LumenVersions {
     pub slsteam_moon: Option<String>,
+    pub slssteam_64_version: Option<String>,
     pub lumen: Option<String>,
     pub luatools: Option<String>,
     pub slssteam_installed: bool,
+    pub slssteam_variant: Option<SlsVariant>,
     pub lumen_installed: bool,
     pub luatools_installed: bool,
 }
@@ -77,12 +109,28 @@ fn read_lumen_versions() -> LumenVersions {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return LumenVersions::default();
     };
-    let slssteam_installed = home.join(".local/share/SLSsteam/SLSsteam.so").is_file();
+    let sls_so = home.join(".local/share/SLSsteam/SLSsteam.so");
+    let slssteam_installed = sls_so.is_file();
+    let slssteam_variant = if slssteam_installed {
+        match elf_class(&sls_so) {
+            Some(1) => Some(SlsVariant::Moon32),
+            Some(2) => Some(SlsVariant::Moon64),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let lumen_installed = home.join(".local/share/Lumen/lumen").is_file();
     let luatools_installed = home.join(".local/share/Lumen/luatools").is_dir();
+    let slssteam_64_version = fs::read_to_string(home.join(".cache/steamrollbackr/sls64_version"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     let mut out = LumenVersions {
         slssteam_installed,
+        slssteam_variant,
+        slssteam_64_version,
         lumen_installed,
         luatools_installed,
         ..Default::default()
@@ -115,6 +163,36 @@ pub struct SteamStatus {
     pub current_version: Option<ClientVersion>,
     pub lock_state: LockState,
     pub lumen_versions: LumenVersions,
+}
+
+impl SteamStatus {
+    pub fn has_steamrt64_client(&self) -> bool {
+        self.steam_dir
+            .as_ref()
+            .is_some_and(|d| d.join("steamrt64/steamclient.so").is_file())
+    }
+
+    pub fn has_ubuntu12_client(&self) -> bool {
+        self.steam_dir
+            .as_ref()
+            .is_some_and(|d| d.join("ubuntu12_32/steamclient.so").is_file())
+    }
+
+    /// Returns the active SLSsteam variant: installed ELF class takes priority,
+    /// then saved preference, then `Moon64` if `steamrt64` is present, else `Moon32`.
+    pub fn active_sls_variant(&self) -> SlsVariant {
+        if let Some(installed) = self.lumen_versions.slssteam_variant {
+            return installed;
+        }
+        if let Some(pref) = read_preferred_sls_variant() {
+            return pref;
+        }
+        if self.has_steamrt64_client() {
+            SlsVariant::Moon64
+        } else {
+            SlsVariant::Moon32
+        }
+    }
 }
 
 pub fn parse_os_release(content: &str) -> (String, String, bool) {
@@ -563,14 +641,22 @@ pub fn restart_steam(steam_dir: &Path, log: &mut dyn FnMut(&str)) -> Result<(), 
     Ok(())
 }
 
+/// Returns the ELF class (`1` = 32-bit, `2` = 64-bit) if `path` starts with `\x7fELF`.
+pub fn elf_class(path: &Path) -> Option<u8> {
+    use std::io::Read;
+    let mut f = fs::File::open(path).ok()?;
+    let mut hdr = [0u8; 5];
+    f.read_exact(&mut hdr).ok()?;
+    if &hdr[..4] == b"\x7fELF" {
+        Some(hdr[4])
+    } else {
+        None
+    }
+}
+
 /// Checks whether a file begins with a 32-bit ELF header (`EI_CLASS == 1`).
 fn is_elf32(path: &Path) -> bool {
-    use std::io::Read;
-    let Ok(mut f) = fs::File::open(path) else {
-        return false;
-    };
-    let mut hdr = [0u8; 5];
-    f.read_exact(&mut hdr).is_ok() && hdr == [0x7F, b'E', b'L', b'F', 1]
+    elf_class(path) == Some(1)
 }
 
 fn find_i386_libcrypto(dir: &Path) -> Option<PathBuf> {
@@ -718,6 +804,51 @@ pub fn read_luatools_moon_fork() -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+pub const SLS64_INSTALL_CMD: &str = "curl -fsSL https://raw.githubusercontent.com/foodiemonster/slssteam-moon-64/main/install-over-luatools.sh | bash && mkdir -p \"$HOME/.cache/steamrollbackr\" && printf moon64 > \"$HOME/.cache/steamrollbackr/sls_variant\" && tag=$(curl -fsSL https://api.github.com/repos/foodiemonster/slssteam-moon-64/releases/latest | grep -m1 '\"tag_name\"' | cut -d'\"' -f4 || true) && ([ -n \"$tag\" ] && printf '%s' \"$tag\" > \"$HOME/.cache/steamrollbackr/sls64_version\" || true)";
+
+/// Reads the user's preferred SLSsteam variant from `~/.cache/steamrollbackr/sls_variant`.
+pub fn read_preferred_sls_variant() -> Option<SlsVariant> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let path = home.join(".cache/steamrollbackr/sls_variant");
+    let content = std::fs::read_to_string(path).ok()?;
+    SlsVariant::from_cache_str(&content)
+}
+
+pub fn is_64bit_migration_dismissed() -> bool {
+    std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join(".cache/steamrollbackr/dismiss_64_migration").is_file())
+        .unwrap_or(false)
+}
+
+pub fn dismiss_64bit_migration() {
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        let dir = home.join(".cache/steamrollbackr");
+        let _ = fs::create_dir_all(&dir);
+        let _ = fs::write(dir.join("dismiss_64_migration"), "1");
+    }
+}
+
+/// Unlocks/updates Steam to `steamrt64` if needed, then installs `slssteam-moon-64`.
+pub fn migrate_to_slssteam_64(
+    steam_dir: Option<&Path>,
+    log: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    if let Some(dir) = steam_dir {
+        let needs_update = !dir.join("steamrt64/steamclient.so").is_file()
+            || check_lock_state(dir).is_locked();
+        if needs_update {
+            unlock_and_update_steam(dir, log)?;
+        }
+        if !dir.join("steamrt64/steamclient.so").is_file() {
+            return Err(
+                "steamrt64/steamclient.so was not found after updating Steam. Try launching Steam once to finish updating, then retry."
+                    .to_string(),
+            );
+        }
+    }
+    run_shell_command(SLS64_INSTALL_CMD, log)
 }
 
 /// Runs a shell command via `sh -c` and streams combined output lines to `log`.

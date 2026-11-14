@@ -6,9 +6,11 @@ use crate::history::{fetch_manifest_content, fetch_releases, ReleaseEntry};
 use crate::i18n::{draw_flag, texts, Language, Texts};
 use crate::slssteam::{check_slsteam_moon, find_best_compatible_release, SlsMoonStatus};
 use crate::steam::{
-    inspect_steam, inspect_steam_with_override, install_libcrypto3, is_luatools_linux_installed,
-    lock_only, restart_steam, rollback_to_manifest, run_shell_command, uninstall_libcrypto3,
-    unlock_and_update_steam, unlock_updates, LockState, ManifestChannel, SteamStatus,
+    dismiss_64bit_migration, inspect_steam, inspect_steam_with_override, install_libcrypto3,
+    is_64bit_migration_dismissed, is_luatools_linux_installed, lock_only, migrate_to_slssteam_64,
+    restart_steam, rollback_to_manifest, run_shell_command, uninstall_libcrypto3,
+    unlock_and_update_steam, unlock_updates, LockState, ManifestChannel, SlsVariant, SteamStatus,
+    SLS64_INSTALL_CMD,
 };
 use crate::updater::{
     check_for_update, detect_install_kind, perform_update, InstallKind, UpdateInfo, UpdateOutcome,
@@ -58,6 +60,7 @@ pub struct SteamRollbackrApp {
     show_update_popup: bool,
     updating_app: bool,
     show_tools_tip: bool,
+    dismiss_64_prompt: bool,
     tools_btn_rect: Option<egui::Rect>,
     current_page: u32,
     has_more: bool,
@@ -499,6 +502,7 @@ impl SteamRollbackrApp {
             show_update_popup: false,
             updating_app: false,
             show_tools_tip: Self::should_show_tools_tip(),
+            dismiss_64_prompt: is_64bit_migration_dismissed(),
             tools_btn_rect: None,
             current_page: 1,
             has_more: true,
@@ -595,10 +599,16 @@ impl SteamRollbackrApp {
             return;
         }
         self.checking_moon = true;
+        let variant = self.status.active_sls_variant();
         let steam_dir = self.status.steam_dir.clone();
+        let local_client_ts = self
+            .status
+            .current_version
+            .as_ref()
+            .map(|v| v.version_id as i64);
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let res = check_slsteam_moon(steam_dir.as_deref());
+            let res = check_slsteam_moon(variant, steam_dir.as_deref(), local_client_ts);
             let _ = tx.send(BgEvent::SlsMoonChecked(res));
         });
     }
@@ -768,6 +778,23 @@ impl SteamRollbackrApp {
         });
     }
 
+    fn start_migrate_to_64(&mut self) {
+        let steam_dir = self.status.steam_dir.clone();
+        self.busy = true;
+        self.initial_ready_only = false;
+        self.logs.clear();
+        self.logs
+            .push("Migrating Steam & SLSsteam to 64-bit (slssteam-moon-64)...".to_string());
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let mut log_fn = |msg: &str| {
+                let _ = tx.send(BgEvent::Log(msg.to_string()));
+            };
+            let res = migrate_to_slssteam_64(steam_dir.as_deref(), &mut log_fn);
+            let _ = tx.send(BgEvent::ActionFinished(res));
+        });
+    }
+
     fn start_restart_steam(&mut self) {
         let Some(steam_dir) = self.status.steam_dir.clone() else {
             return;
@@ -791,24 +818,33 @@ impl SteamRollbackrApp {
             self.logs.push("Error: Steam directory not found.".to_string());
             return;
         };
+        let variant = self.status.active_sls_variant();
+        let local_client_ts = self
+            .status
+            .current_version
+            .as_ref()
+            .map(|v| v.version_id as i64);
         self.busy = true;
         self.initial_ready_only = false;
         self.logs.clear();
-        self.logs
-            .push("Checking latest slsteam-moon compatible Steam release...".to_string());
+        self.logs.push(format!(
+            "Checking latest {} compatible Steam release...",
+            variant.display_name()
+        ));
 
         let tx = self.tx.clone();
         thread::spawn(move || {
             let mut log_fn = |msg: &str| {
                 let _ = tx.send(BgEvent::Log(msg.to_string()));
             };
-            let res = match check_slsteam_moon(Some(&steam_dir)) {
+            let res = match check_slsteam_moon(variant, Some(&steam_dir), local_client_ts) {
                 Ok(moon) => {
                     log_fn(&format!(
-                        "slsteam-moon / steam-monitor pattern date: {}",
+                        "{} pattern/release date: {}",
+                        variant.display_name(),
                         moon.monitor_display
                     ));
-                    match find_best_compatible_release(moon.monitor_timestamp_utc) {
+                    match find_best_compatible_release(variant, moon.monitor_timestamp_utc) {
                         Ok((best, list)) => {
                             log_fn(&format!(
                                 "Auto-selected: [{}] {} ({})",
@@ -947,8 +983,8 @@ impl SteamRollbackrApp {
 
                 for (tab, icon, label) in [
                     (ActiveTab::Home, SidebarIcon::Home, t.nav_home),
-                    (ActiveTab::Advanced, SidebarIcon::Advanced, t.nav_advanced),
                     (ActiveTab::Tools, SidebarIcon::Tools, t.nav_tools),
+                    (ActiveTab::Advanced, SidebarIcon::Advanced, t.nav_advanced),
                     (
                         ActiveTab::Troubleshooting,
                         SidebarIcon::Troubleshooting,
@@ -1123,10 +1159,26 @@ impl SteamRollbackrApp {
 
     fn render_home(&mut self, ui: &mut egui::Ui, t: &Texts) {
         let has_steam = self.status.steam_dir.is_some();
+        let active_variant = self.status.active_sls_variant();
+        let has_rt64 = self.status.has_steamrt64_client();
+        let has_u12 = self.status.has_ubuntu12_client();
+        let mismatch_msg = match self.status.lumen_versions.slssteam_variant {
+            Some(SlsVariant::Moon32) if has_steam && has_rt64 && !has_u12 => Some(t.mismatch_32_on_64),
+            Some(SlsVariant::Moon64) if has_steam && !has_rt64 && has_u12 => Some(t.mismatch_64_on_32),
+            _ => None,
+        };
 
         // 1. Compatibility Banner at top (with bold keywords)
         let mut job = egui::text::LayoutJob::default();
-        let (banner_bg, banner_border) = if self.checking_moon {
+        let (banner_bg, banner_border) = if let Some(msg) = mismatch_msg {
+            let fmt = egui::TextFormat {
+                font_id: egui::FontId::proportional(13.5),
+                color: Color32::from_rgb(245, 210, 130),
+                ..Default::default()
+            };
+            job.append(msg, 0.0, fmt);
+            (Color32::from_rgb(58, 46, 24), Color32::from_rgb(138, 104, 42))
+        } else if self.checking_moon {
             let fmt = egui::TextFormat {
                 font_id: egui::FontId::proportional(13.5),
                 color: Color32::LIGHT_GRAY,
@@ -1151,16 +1203,23 @@ impl SteamRollbackrApp {
                             color: Color32::from_rgb(205, 255, 220),
                             ..Default::default()
                         };
-                        let ver = st
-                            .latest_moon_version
-                            .as_deref()
-                            .map(|v| format!("slsteam-moon {v}"))
-                            .unwrap_or_else(|| "slsteam-moon".to_string());
-                        job.append(t.banner_compat_p1, 0.0, reg.clone());
-                        job.append(&ver, 0.0, bold.clone());
-                        job.append(t.banner_compat_p2, 0.0, reg.clone());
-                        job.append(t.banner_compat_btn, 0.0, bold);
-                        job.append(t.banner_compat_p3, 0.0, reg);
+                        let vname = st.variant.display_name();
+                        let ver = match st.latest_moon_version.as_deref() {
+                            Some(v) if v.to_ascii_lowercase().contains("moon") => v.to_string(),
+                            Some(v) => format!("{vname} {v}"),
+                            None => vname.to_string(),
+                        };
+                        if self.status.lock_state.is_locked() {
+                            job.append(t.banner_compat_p1, 0.0, reg.clone());
+                            job.append(&ver, 0.0, bold.clone());
+                            job.append(t.banner_compat_p2, 0.0, reg.clone());
+                            job.append(t.banner_compat_btn, 0.0, bold);
+                            job.append(t.banner_compat_p3, 0.0, reg);
+                        } else {
+                            job.append(t.banner_ok_p1, 0.0, reg.clone());
+                            job.append(&ver, 0.0, bold);
+                            job.append(t.banner_ok_p2, 0.0, reg);
+                        }
                         (Color32::from_rgb(28, 56, 38), Color32::from_rgb(56, 128, 78))
                     }
                     Some(false) => {
@@ -1178,7 +1237,7 @@ impl SteamRollbackrApp {
                             ..Default::default()
                         };
                         job.append(t.banner_incompat_p1, 0.0, reg.clone());
-                        job.append("slsteam-moon", 0.0, bold.clone());
+                        job.append(st.variant.display_name(), 0.0, bold.clone());
                         job.append(t.banner_incompat_p2, 0.0, reg.clone());
                         job.append(t.banner_incompat_btn, 0.0, bold);
                         job.append(t.banner_incompat_p3, 0.0, reg);
@@ -1231,6 +1290,69 @@ impl SteamRollbackrApp {
             });
 
         ui.add_space(12.0);
+
+        // 1b. Contextual 64-bit migration banner for legacy 32-bit / ubuntu12 users
+        let show_64_migration = !self.dismiss_64_prompt
+            && has_steam
+            && mismatch_msg.is_none()
+            && (self.status.lumen_versions.slssteam_variant == Some(SlsVariant::Moon32)
+                || (has_u12 && !has_rt64));
+        if show_64_migration {
+            egui::Frame::none()
+                .fill(Color32::from_rgb(28, 44, 66))
+                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(64, 112, 172)))
+                .rounding(Rounding::same(10.0))
+                .inner_margin(Margin::symmetric(14.0, 10.0))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(t.migrate_64_title)
+                                .strong()
+                                .size(13.5)
+                                .color(Color32::from_rgb(175, 215, 255)),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("×").size(15.0).color(Color32::LIGHT_GRAY),
+                                    )
+                                    .frame(false),
+                                )
+                                .clicked()
+                            {
+                                self.dismiss_64_prompt = true;
+                                dismiss_64bit_migration();
+                            }
+                        });
+                    });
+                    ui.add_space(2.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(t.migrate_64_desc)
+                                .size(12.5)
+                                .color(Color32::from_rgb(210, 225, 245)),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(8.0);
+                    let btn = egui::Button::new(
+                        RichText::new(t.migrate_64_btn)
+                            .strong()
+                            .size(12.5)
+                            .color(Color32::WHITE),
+                    )
+                    .fill(Color32::from_rgb(42, 88, 142))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(76, 136, 206)))
+                    .rounding(Rounding::same(6.0))
+                    .min_size(Vec2::new(0.0, 28.0));
+                    if ui.add_enabled(!self.busy, btn).clicked() {
+                        self.start_migrate_to_64();
+                    }
+                });
+            ui.add_space(12.0);
+        }
 
         let is_locked = self.status.lock_state.is_locked();
 
@@ -1431,7 +1553,7 @@ impl SteamRollbackrApp {
             let gap = 16.0;
 
             let col1_w = ui.fonts(|f| {
-                [t.steam_client, "slssteam-moon", "LuaTools", "Lumen"]
+                [t.steam_client, active_variant.display_name(), "LuaTools", "Lumen"]
                     .iter()
                     .map(|s| f.layout_no_wrap((*s).to_string(), body_font.clone(), Color32::WHITE).size().x)
                     .fold(0.0_f32, f32::max)
@@ -1538,13 +1660,26 @@ impl SteamRollbackrApp {
 
             row_sep(ui);
 
-            // Row 2: slssteam-moon
-            let moon_ver = self
-                .status
-                .lumen_versions
-                .slsteam_moon
-                .as_deref()
-                .unwrap_or("—");
+            // Row 2: slssteam-moon / slssteam-moon-64
+            let moon_ver = match active_variant {
+                SlsVariant::Moon64 => {
+                    if self.status.lumen_versions.slssteam_variant == Some(SlsVariant::Moon64) {
+                        self.status
+                            .lumen_versions
+                            .slssteam_64_version
+                            .as_deref()
+                            .unwrap_or("ELF64")
+                    } else {
+                        "—"
+                    }
+                }
+                SlsVariant::Moon32 => self
+                    .status
+                    .lumen_versions
+                    .slsteam_moon
+                    .as_deref()
+                    .unwrap_or("—"),
+            };
             let moon_badge = if let Some(Ok(st)) = &self.moon_status {
                 match st.local_pattern_supported {
                     Some(true) => Some((t.local_pattern_ok, green_bg, green_fg)),
@@ -1565,8 +1700,8 @@ impl SteamRollbackrApp {
             };
             draw_status_row(
                 ui,
-                "slssteam-moon",
-                Some(("https://github.com/swwayps/slsteam-moon", t.open_repo_hover)),
+                active_variant.display_name(),
+                Some((active_variant.repo_url(), t.open_repo_hover)),
                 moon_ver,
                 moon_badge,
             );
@@ -2235,7 +2370,182 @@ impl SteamRollbackrApp {
 
                 ui.add_space(10.0);
 
-                // Tool 2: Unified LuaTools Switcher
+                // Tool 2: SLSsteam Variant Switcher (slssteam-moon-64 vs slssteam-moon)
+                let installed_variant = self.status.lumen_versions.slssteam_variant;
+                let has_rt64_client = self.status.has_steamrt64_client();
+                let sls64_active = installed_variant == Some(SlsVariant::Moon64);
+                let sls32_active = installed_variant == Some(SlsVariant::Moon32);
+                let sls64_cmd = SLS64_INSTALL_CMD;
+                let sls32_cmd = "set -euo pipefail; TMP=$(mktemp -d); trap 'rm -rf \"$TMP\"' EXIT; URL=$(curl -fsSL https://api.github.com/repos/swwayps/slsteam-moon/releases/latest | grep -Eo 'https://[^\"]+\\.zip' | head -n 1); curl -fL \"$URL\" -o \"$TMP/sls32.zip\"; unzip -q \"$TMP/sls32.zip\" -d \"$TMP/ext\"; ROOT=$(find \"$TMP/ext\" -maxdepth 2 -name setup.sh -printf '%h\\n' | head -n 1); (cd \"$ROOT\" && ./setup.sh install < /dev/null); mkdir -p \"$HOME/.cache/steamrollbackr\"; printf moon32 > \"$HOME/.cache/steamrollbackr/sls_variant\"; rm -f \"$HOME/.cache/steamrollbackr/sls64_version\"";
+
+                card_frame().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(t.sls_section_title)
+                                .font(bold_font.clone())
+                                .color(Color32::WHITE),
+                        );
+                        ui.add_space(6.0);
+                        if sls64_active {
+                            pill_badge(ui, "64-bit", green_bg, green_fg);
+                        } else if sls32_active {
+                            pill_badge(ui, "32-bit", green_bg, green_fg);
+                        } else {
+                            pill_badge(
+                                ui,
+                                t.not_found_pill,
+                                Color32::from_rgb(54, 54, 58),
+                                Color32::GRAY,
+                            );
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(t.sls_section_desc).color(Color32::LIGHT_GRAY),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(10.0);
+
+                    let option_frame = |active: bool| {
+                        egui::Frame::none()
+                            .fill(Color32::from_rgb(44, 45, 50))
+                            .stroke(Stroke::new(
+                                1.0_f32,
+                                if active {
+                                    Color32::from_rgb(72, 148, 92)
+                                } else {
+                                    Color32::from_rgb(64, 66, 72)
+                                },
+                            ))
+                            .rounding(Rounding::same(8.0))
+                            .inner_margin(Margin::same(12.0))
+                    };
+
+                    // Option A: slssteam-moon-64
+                    option_frame(sls64_active).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(t.sls_64_title)
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            );
+                            if has_rt64_client {
+                                ui.add_space(4.0);
+                                pill_badge(
+                                    ui,
+                                    t.recommended_pill,
+                                    Color32::from_rgb(38, 72, 118),
+                                    Color32::from_rgb(135, 195, 255),
+                                );
+                            }
+                            if sls64_active {
+                                ui.add_space(4.0);
+                                pill_badge(ui, t.active_pill, green_bg, green_fg);
+                            }
+                        });
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(t.sls_64_desc)
+                                    .size(12.5)
+                                    .color(Color32::LIGHT_GRAY),
+                            )
+                            .wrap(),
+                        );
+                        if !has_rt64_client {
+                            ui.add_space(4.0);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(t.sls_64_requires_rt64)
+                                        .size(12.0)
+                                        .color(Color32::from_rgb(245, 200, 110)),
+                                )
+                                .wrap(),
+                            );
+                        }
+                        ui.add_space(8.0);
+                        if !has_rt64_client {
+                            if tool_btn(
+                                ui,
+                                t.migrate_64_tools_btn,
+                                !self.busy && has_steam,
+                                Color32::from_rgb(42, 88, 142),
+                                Color32::from_rgb(76, 136, 206),
+                            )
+                            .clicked()
+                            {
+                                self.start_migrate_to_64();
+                            }
+                        } else {
+                            let btn_label = if sls64_active {
+                                t.reinstall_btn
+                            } else if sls32_active {
+                                t.switch_btn
+                            } else {
+                                t.install_btn
+                            };
+                            let (fill, stroke) = if sls64_active {
+                                (Color32::from_rgb(56, 60, 68), Color32::from_rgb(92, 96, 108))
+                            } else {
+                                (Color32::from_rgb(42, 88, 142), Color32::from_rgb(76, 136, 206))
+                            };
+                            if tool_btn(ui, btn_label, !self.busy, fill, stroke).clicked() {
+                                self.start_shell_tool("Installing slssteam-moon-64...", sls64_cmd);
+                            }
+                        }
+                    });
+
+                    ui.add_space(8.0);
+
+                    // Option B: slssteam-moon (32-bit)
+                    option_frame(sls32_active).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(t.sls_32_title)
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            );
+                            if sls32_active {
+                                ui.add_space(4.0);
+                                pill_badge(ui, t.active_pill, green_bg, green_fg);
+                            }
+                        });
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(t.sls_32_desc)
+                                    .size(12.5)
+                                    .color(Color32::LIGHT_GRAY),
+                            )
+                            .wrap(),
+                        );
+                        ui.add_space(8.0);
+                        let btn_label = if sls32_active {
+                            t.reinstall_btn
+                        } else if sls64_active {
+                            t.switch_btn
+                        } else {
+                            t.install_btn
+                        };
+                        let (fill, stroke) = if sls32_active {
+                            (Color32::from_rgb(56, 60, 68), Color32::from_rgb(92, 96, 108))
+                        } else {
+                            (Color32::from_rgb(42, 88, 142), Color32::from_rgb(76, 136, 206))
+                        };
+                        if tool_btn(ui, btn_label, !self.busy, fill, stroke).clicked() {
+                            self.start_shell_tool("Installing slssteam-moon (32-bit)...", sls32_cmd);
+                        }
+                    });
+                });
+
+                ui.add_space(10.0);
+
+                // Tool 3: Unified LuaTools Switcher
                 let any_luatools = rafie_installed || swwayps_installed || luatools_linux_installed;
                 card_frame().show(ui, |ui| {
                     ui.set_width(ui.available_width());
@@ -2281,6 +2591,14 @@ impl SteamRollbackrApp {
                             .inner_margin(Margin::same(12.0))
                     };
 
+                    let preserve_64_suffix = if self.status.active_sls_variant() == SlsVariant::Moon64
+                        && has_rt64_client
+                    {
+                        format!(" && {sls64_cmd}")
+                    } else {
+                        String::new()
+                    };
+
                     // Option A: Rafie-kun / luatools-moon (Recommended)
                     option_frame(rafie_installed).show(ui, |ui| {
                         ui.set_width(ui.available_width());
@@ -2323,9 +2641,12 @@ impl SteamRollbackrApp {
                                 )
                                 .clicked()
                                 {
+                                    let cmd = format!(
+                                        "curl -fsSL https://raw.githubusercontent.com/Rafie-kun/luatools-moon/main/install.sh | bash && mkdir -p \"$HOME/.cache/steamrollbackr\" && printf rafie > \"$HOME/.cache/steamrollbackr/luatools_moon_fork\"{preserve_64_suffix}"
+                                    );
                                     self.start_shell_tool(
                                         "Reinstalling LuaTools (Rafie-kun)...",
-                                        "curl -fsSL https://raw.githubusercontent.com/Rafie-kun/luatools-moon/main/install.sh | bash && mkdir -p \"$HOME/.cache/steamrollbackr\" && printf rafie > \"$HOME/.cache/steamrollbackr/luatools_moon_fork\"",
+                                        &cmd,
                                     );
                                 }
                                 if tool_btn(
@@ -2358,9 +2679,12 @@ impl SteamRollbackrApp {
                             )
                             .clicked()
                             {
+                                let cmd = format!(
+                                    "curl -fsSL https://raw.githubusercontent.com/Rafie-kun/luatools-moon/main/install.sh | bash && mkdir -p \"$HOME/.cache/steamrollbackr\" && printf rafie > \"$HOME/.cache/steamrollbackr/luatools_moon_fork\"{preserve_64_suffix}"
+                                );
                                 self.start_shell_tool(
                                     "Installing LuaTools (Rafie-kun)...",
-                                    "curl -fsSL https://raw.githubusercontent.com/Rafie-kun/luatools-moon/main/install.sh | bash && mkdir -p \"$HOME/.cache/steamrollbackr\" && printf rafie > \"$HOME/.cache/steamrollbackr/luatools_moon_fork\"",
+                                    &cmd,
                                 );
                             }
                         }
@@ -2403,9 +2727,12 @@ impl SteamRollbackrApp {
                                 )
                                 .clicked()
                                 {
+                                    let cmd = format!(
+                                        "curl -fsSL https://raw.githubusercontent.com/swwayps/luatools-moon/main/install.sh | bash && mkdir -p \"$HOME/.cache/steamrollbackr\" && printf swwayps > \"$HOME/.cache/steamrollbackr/luatools_moon_fork\"{preserve_64_suffix}"
+                                    );
                                     self.start_shell_tool(
                                         "Reinstalling LuaTools (swwayps)...",
-                                        "curl -fsSL https://raw.githubusercontent.com/swwayps/luatools-moon/main/install.sh | bash && mkdir -p \"$HOME/.cache/steamrollbackr\" && printf swwayps > \"$HOME/.cache/steamrollbackr/luatools_moon_fork\"",
+                                        &cmd,
                                     );
                                 }
                                 if tool_btn(
@@ -2438,9 +2765,12 @@ impl SteamRollbackrApp {
                             )
                             .clicked()
                             {
+                                let cmd = format!(
+                                    "curl -fsSL https://raw.githubusercontent.com/swwayps/luatools-moon/main/install.sh | bash && mkdir -p \"$HOME/.cache/steamrollbackr\" && printf swwayps > \"$HOME/.cache/steamrollbackr/luatools_moon_fork\"{preserve_64_suffix}"
+                                );
                                 self.start_shell_tool(
                                     "Installing LuaTools (swwayps)...",
-                                    "curl -fsSL https://raw.githubusercontent.com/swwayps/luatools-moon/main/install.sh | bash && mkdir -p \"$HOME/.cache/steamrollbackr\" && printf swwayps > \"$HOME/.cache/steamrollbackr/luatools_moon_fork\"",
+                                    &cmd,
                                 );
                             }
                         }
