@@ -163,16 +163,24 @@ pub struct SteamStatus {
     pub current_version: Option<ClientVersion>,
     pub lock_state: LockState,
     pub lumen_versions: LumenVersions,
+    pub sim_has_rt64: Option<bool>,
+    pub sim_has_u12: Option<bool>,
 }
 
 impl SteamStatus {
     pub fn has_steamrt64_client(&self) -> bool {
+        if let Some(v) = self.sim_has_rt64 {
+            return v;
+        }
         self.steam_dir
             .as_ref()
             .is_some_and(|d| d.join("steamrt64/steamclient.so").is_file())
     }
 
     pub fn has_ubuntu12_client(&self) -> bool {
+        if let Some(v) = self.sim_has_u12 {
+            return v;
+        }
         self.steam_dir
             .as_ref()
             .is_some_and(|d| d.join("ubuntu12_32/steamclient.so").is_file())
@@ -365,6 +373,8 @@ pub fn inspect_steam_with_override(override_dir: Option<&Path>) -> SteamStatus {
                 current_version,
                 lock_state,
                 lumen_versions,
+                sim_has_rt64: None,
+                sim_has_u12: None,
             }
         }
         None => SteamStatus {
@@ -374,6 +384,8 @@ pub fn inspect_steam_with_override(override_dir: Option<&Path>) -> SteamStatus {
             current_version: None,
             lock_state: LockState::Unlocked,
             lumen_versions,
+            sim_has_rt64: None,
+            sim_has_u12: None,
         },
     }
 }
@@ -470,6 +482,26 @@ fn build_steam_launcher_candidates(
     out
 }
 
+/// Builds a distro- and sandbox-aware Steam launch command with clean environment
+/// (no `LD_AUDIT`, `LD_PRELOAD`, or `~/.local/share/SLSsteam/path` in `PATH`).
+fn build_clean_steam_command(
+    steam_dir: &Path,
+    extra_args: &[&str],
+) -> Result<(Command, String), String> {
+    let (mut cmd, desc) = build_steam_command(steam_dir, extra_args)?;
+    cmd.env_remove("LD_AUDIT");
+    cmd.env_remove("LD_PRELOAD");
+    if let Some(path_val) = std::env::var_os("PATH") {
+        let filtered: Vec<PathBuf> = std::env::split_paths(&path_val)
+            .filter(|p| !p.to_string_lossy().contains(".local/share/SLSsteam"))
+            .collect();
+        if let Ok(joined) = std::env::join_paths(filtered) {
+            cmd.env("PATH", joined);
+        }
+    }
+    Ok((cmd, desc))
+}
+
 /// Builds a distro- and sandbox-aware Steam launch command.
 fn build_steam_command(steam_dir: &Path, extra_args: &[&str]) -> Result<(Command, String), String> {
     if is_flatpak_steam_dir(steam_dir) {
@@ -530,7 +562,7 @@ fn write_lock_cfg(steam_dir: &Path) -> Result<(), String> {
 
 fn kill_steam(log: &mut dyn FnMut(&str)) {
     log("Stopping any running Steam processes...");
-    for proc_name in ["steam", "steamwebhelper"] {
+    for proc_name in ["steam", "steamwebhelper", "reaper", "srt-bwrap"] {
         let _ = Command::new("pkill")
             .args(["-9", "-x", proc_name])
             .status();
@@ -830,25 +862,287 @@ pub fn dismiss_64bit_migration() {
     }
 }
 
-/// Unlocks/updates Steam to `steamrt64` if needed, then installs `slssteam-moon-64`.
-pub fn migrate_to_slssteam_64(
+fn stop_slssteam_guardians(home: &Path, log: &mut dyn FnMut(&str)) {
+    let unit_dir = home.join(".config/systemd/user");
+    let mut removed_any = false;
+    if let Ok(entries) = fs::read_dir(&unit_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let lower = name.to_ascii_lowercase();
+            if (lower.contains("slsteam") || lower.contains("slssteam"))
+                && (lower.ends_with(".service")
+                    || lower.ends_with(".path")
+                    || lower.ends_with(".timer"))
+            {
+                let _ = Command::new("systemctl")
+                    .args(["--user", "stop", name])
+                    .status();
+                let _ = Command::new("systemctl")
+                    .args(["--user", "disable", name])
+                    .status();
+                if fs::remove_file(&path).is_ok() {
+                    removed_any = true;
+                }
+                log(&format!("Stopped and removed guardian unit: {name}"));
+            }
+        }
+    }
+    if removed_any {
+        let _ = Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status();
+        let _ = Command::new("systemctl")
+            .args(["--user", "reset-failed"])
+            .status();
+    }
+}
+
+fn kill_lumen(log: &mut dyn FnMut(&str)) {
+    log("Stopping any running Lumen processes...");
+    let _ = Command::new("pkill").args(["-9", "-x", "lumen"]).status();
+}
+
+fn restore_patched_desktop_files(home: &Path, log: &mut dyn FnMut(&str)) {
+    let backup_dir = home.join(".local/share/SLSsteam/backup");
+    let mut dirs = vec![home.join(".config/autostart")];
+    if let Some(xdg_data) = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from) {
+        dirs.push(xdg_data.join("applications"));
+    } else {
+        dirs.push(home.join(".local/share/applications"));
+    }
+
+    for dir in dirs {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.ends_with(".desktop") {
+                continue;
+            }
+            let Ok(content) = fs::read_to_string(&path) else {
+                continue;
+            };
+            if !content.contains("X-SLSteamMoon-Patched=true") {
+                continue;
+            }
+
+            let backup_candidate = backup_dir.join(name);
+            if backup_candidate.is_file() {
+                if fs::copy(&backup_candidate, &path).is_ok() {
+                    log(&format!("Restored desktop entry from backup: {name}"));
+                    continue;
+                }
+            }
+
+            let cleaned: Vec<String> = content
+                .lines()
+                .filter(|line| line.trim() != "X-SLSteamMoon-Patched=true")
+                .map(|line| {
+                    if let Some(rest) = line.strip_prefix("Exec=") {
+                        if rest.contains(".local/share/SLSsteam/path/steam") {
+                            let args = rest
+                                .split_once(".local/share/SLSsteam/path/steam")
+                                .map(|(_, tail)| tail)
+                                .unwrap_or("");
+                            return format!("Exec=steam{args}");
+                        }
+                    }
+                    line.to_string()
+                })
+                .collect();
+            let _ = fs::write(&path, format!("{}\n", cleaned.join("\n")));
+            log(&format!("Unhooked patched desktop entry: {name}"));
+        }
+    }
+}
+
+fn sanitize_steam_package_dir(steam_dir: &Path, log: &mut dyn FnMut(&str)) -> Result<(), String> {
+    let pkg = steam_dir.join("package");
+    if pkg.is_dir() {
+        let _ = Command::new("chmod").args(["-R", "u+rwX"]).arg(&pkg).status();
+        set_package_writable(steam_dir, true)?;
+        if let Ok(entries) = fs::read_dir(&pkg) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if name.starts_with("steam_client_ubuntu12")
+                    || name.ends_with(".tmp")
+                    || name.contains(".zip.vz")
+                    || name.ends_with(".installed")
+                {
+                    let _ = fs::remove_file(&p);
+                }
+            }
+        }
+        log("Sanitized Steam package/ directory (removed legacy ubuntu12 & stale update markers).");
+    }
+
+    let libcrypto = steam_dir.join("ubuntu12_32/libcrypto.so.3");
+    if libcrypto.is_file() || fs::symlink_metadata(&libcrypto).is_ok() {
+        let _ = fs::remove_file(&libcrypto);
+        log("Removed legacy ubuntu12_32/libcrypto.so.3.");
+    }
+    Ok(())
+}
+
+struct CleanPreState {
+    home: PathBuf,
+    luatools_fork: Option<String>,
+}
+
+/// Phases 1-4: stops Steam/Lumen/guardians, removes all SLSsteam/Lumen/LuaTools binaries
+/// and `.desktop` hooks, sanitizes Steam's `package/`, and runs a clean `steamrt64` update.
+/// Preserves `steamapps/`, `userdata/`, `config/`, and `~/.config/SLSsteam/`.
+fn cleanup_and_update_vanilla_steam(
     steam_dir: Option<&Path>,
     log: &mut dyn FnMut(&str),
-) -> Result<(), String> {
-    if let Some(dir) = steam_dir {
-        let needs_update = !dir.join("steamrt64/steamclient.so").is_file()
-            || check_lock_state(dir).is_locked();
-        if needs_update {
-            unlock_and_update_steam(dir, log)?;
+) -> Result<CleanPreState, String> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME environment variable is not set.".to_string())?;
+
+    // Phase 1: Stop Steam, Lumen & guardian units
+    log("Phase 1: Stopping Steam, Lumen, and SLSsteam guardian units...");
+    kill_steam(log);
+    kill_lumen(log);
+    stop_slssteam_guardians(&home, log);
+
+    // Phase 2: Unhook wrappers and clean old tooling binaries (preserve ~/.config/SLSsteam/)
+    log("Phase 2: Cleaning SLSsteam/Lumen/LuaTools binaries (preserving ~/.config/SLSsteam/)...");
+    let luatools_fork = read_luatools_moon_fork();
+    restore_patched_desktop_files(&home, log);
+
+    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
+        let sls_runtime = runtime_dir.join("SLSsteam");
+        if sls_runtime.exists() {
+            let _ = fs::remove_dir_all(&sls_runtime);
+            log(&format!("Cleaned runtime dir {}", sls_runtime.display()));
         }
-        if !dir.join("steamrt64/steamclient.so").is_file() {
+    }
+
+    for dir in [
+        home.join(".local/share/SLSsteam"),
+        home.join(".local/state/slsteam-moon"),
+        home.join(".local/share/Lumen"),
+    ] {
+        if dir.exists() {
+            fs::remove_dir_all(&dir)
+                .map_err(|e| format!("Failed to clean {}: {e}", dir.display()))?;
+            log(&format!("Removed {}", dir.display()));
+        }
+    }
+
+    // Phase 3 & 4: Sanitize Steam installation & run clean vanilla steamrt64 update
+    if let Some(dir) = steam_dir {
+        log("Phase 3: Unlocking and sanitizing Steam installation (preserving games & accounts)...");
+        for name in ["Steam.cfg", "steam.cfg"] {
+            let p = dir.join(name);
+            if p.exists() || fs::symlink_metadata(&p).is_ok() {
+                fs::remove_file(&p).map_err(|e| format!("Failed to remove {name}: {e}"))?;
+            }
+        }
+        sanitize_steam_package_dir(dir, log)?;
+
+        log("Phase 4: Running clean vanilla Steam update to steamrt64...");
+        let (mut cmd, launcher_desc) = build_clean_steam_command(
+            dir,
+            &["-forcemanifestsuffix", "steamrt64", "-forcesteamupdate", "-exitsteam"],
+        )?;
+        log(&format!("Updating Steam via {launcher_desc}..."));
+        let status = cmd
+            .status()
+            .map_err(|e| format!("Failed to run Steam updater: {e}"))?;
+        log(&format!("Steam updater exited with status: {status}"));
+
+        if !dir.join("steamrt64/steamclient.so").is_file()
+            || !dir.join("steamrt64/steamui.so").is_file()
+        {
             return Err(
-                "steamrt64/steamclient.so was not found after updating Steam. Try launching Steam once to finish updating, then retry."
+                "steamrt64 client files were not found after updating Steam. Launch Steam once normally to finish updating, then retry."
                     .to_string(),
             );
         }
     }
-    run_shell_command(SLS64_INSTALL_CMD, log)
+
+    Ok(CleanPreState {
+        home,
+        luatools_fork,
+    })
+}
+
+/// Removes all SLSsteam/Lumen/LuaTools installations and restores latest vanilla `steamrt64` Steam.
+pub fn full_uninstall_to_vanilla_steam(
+    steam_dir: Option<&Path>,
+    log: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    let state = cleanup_and_update_vanilla_steam(steam_dir, log)?;
+
+    let standalone_lt = state.home.join(".local/bin/luatools");
+    if standalone_lt.exists() || fs::symlink_metadata(&standalone_lt).is_ok() {
+        let _ = fs::remove_file(&standalone_lt);
+        log("Removed ~/.local/bin/luatools.");
+    }
+
+    let cache_dir = state.home.join(".cache/steamrollbackr");
+    for name in ["sls_variant", "sls64_version", "luatools_moon_fork"] {
+        let _ = fs::remove_file(cache_dir.join(name));
+    }
+
+    log("SUCCESS! All tools removed and Steam is updated to vanilla steamrt64.");
+    Ok(())
+}
+
+/// Clean-slate migration/reinstall to `steamrt64` + `slssteam-moon-64`.
+/// Preserves `steamapps/`, `userdata/`, `config/`, and `~/.config/SLSsteam/`.
+pub fn migrate_to_slssteam_64(
+    steam_dir: Option<&Path>,
+    log: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    let state = cleanup_and_update_vanilla_steam(steam_dir, log)?;
+
+    // Phase 5: Fresh reinstall of LuaTools + Lumen and slssteam-moon-64
+    log("Phase 5: Installing fresh LuaTools, Lumen & slssteam-moon-64...");
+    let (fork_name, install_url) = match state.luatools_fork.as_deref() {
+        Some("swwayps") => (
+            "swwayps",
+            "https://raw.githubusercontent.com/swwayps/luatools-moon/main/install.sh",
+        ),
+        _ => (
+            "rafie",
+            "https://raw.githubusercontent.com/Rafie-kun/luatools-moon/main/install.sh",
+        ),
+    };
+    log(&format!("Installing LuaTools & Lumen ({fork_name})..."));
+    let cmd = format!(
+        "curl -fsSL {install_url} | bash && mkdir -p \"$HOME/.cache/steamrollbackr\" && printf {fork_name} > \"$HOME/.cache/steamrollbackr/luatools_moon_fork\""
+    );
+    run_shell_command(&cmd, log)?;
+    // Ensure any daemon/guardian started by LuaTools' 32-bit setup.sh is stopped before 64-bit overlay
+    kill_lumen(log);
+    stop_slssteam_guardians(&state.home, log);
+
+    run_shell_command(SLS64_INSTALL_CMD, log)?;
+
+    let _ = Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status();
+
+    let sls_so = state.home.join(".local/share/SLSsteam/SLSsteam.so");
+    if elf_class(&sls_so) != Some(2) {
+        return Err("Post-install check failed: SLSsteam.so is not ELF64.".to_string());
+    }
+
+    log("SUCCESS! Clean 64-bit Steam + slssteam-moon-64 setup is ready.");
+    Ok(())
 }
 
 /// Runs a shell command via `sh -c` and streams combined output lines to `log`.
