@@ -1,10 +1,7 @@
-# SteamRollbackr v0.6.7
+# SteamRollbackrLite v0.1.0
 
 ## What's New
 
-### SLSsteam Update Detection & One-Click Update
-- **Repo Version Comparison**: Compares your locally installed `slssteam-moon` or `slssteam-moon-64` version against the latest GitHub release (`foodiemonster/slssteam-moon-64` or `swwayps/slsteam-moon`).
-- **Clickable `Update available` Badge**: When a newer release is available, **System Status** displays an **`Update available`** badge next to the `slssteam-moon` / `slssteam-moon-64` entry (with a tooltip showing the target version). Clicking it triggers the update directly.
-
-### Fixes
-- **Full Steam Unlock Before Clean Reset & Full Uninstall**: Both **Clean Reset & Reinstall (64-bit)** and **Full Uninstall (Vanilla Steam)** now run `unlock_updates` first to restore write permissions on Steam's `package/` directory and remove `Steam.cfg` / `steam.cfg` before sanitizing or updating Steam.
+### Lite Edition
+- **Focused Rollback & Lock Workflow**: Streamlined **Home** view to select a Steam channel (`steamrt64` 64-bit or `ubuntu12` 32-bit), pick a specific Steam release, **Rollback & Lock Updates**, **Lock Current Version**, **Unlock Only**, or **Unlock & Update Steam** back to the latest official client.
+- **Focused Tools Tab**: Simplified **Tools** section containing only 32-bit `libcrypto.so.3` installation and removal.

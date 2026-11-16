@@ -1,5 +1,4 @@
 use chrono::{DateTime, Local, Utc};
-use serde::Deserialize;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -51,102 +50,6 @@ impl LockState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SlsVariant {
-    Moon32,
-    Moon64,
-}
-
-impl SlsVariant {
-    pub fn display_name(self) -> &'static str {
-        match self {
-            SlsVariant::Moon32 => "slssteam-moon",
-            SlsVariant::Moon64 => "slssteam-moon-64",
-        }
-    }
-
-    pub fn repo_url(self) -> &'static str {
-        match self {
-            SlsVariant::Moon32 => "https://github.com/swwayps/slsteam-moon",
-            SlsVariant::Moon64 => "https://github.com/foodiemonster/slssteam-moon-64",
-        }
-    }
-
-    pub fn from_cache_str(s: &str) -> Option<Self> {
-        match s.trim() {
-            "moon32" => Some(SlsVariant::Moon32),
-            "moon64" => Some(SlsVariant::Moon64),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct LumenVersions {
-    pub slsteam_moon: Option<String>,
-    pub slssteam_64_version: Option<String>,
-    pub lumen: Option<String>,
-    pub luatools: Option<String>,
-    pub slssteam_installed: bool,
-    pub slssteam_variant: Option<SlsVariant>,
-    pub lumen_installed: bool,
-    pub luatools_installed: bool,
-}
-
-#[derive(Deserialize)]
-struct LumenVersionsJson {
-    slsteam_moon: Option<LumenComponent>,
-    lumen: Option<LumenComponent>,
-    plugin: Option<LumenComponent>,
-}
-
-#[derive(Deserialize)]
-struct LumenComponent {
-    tag: Option<String>,
-}
-
-fn read_lumen_versions() -> LumenVersions {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return LumenVersions::default();
-    };
-    let sls_so = home.join(".local/share/SLSsteam/SLSsteam.so");
-    let slssteam_installed = sls_so.is_file();
-    let slssteam_variant = if slssteam_installed {
-        match elf_class(&sls_so) {
-            Some(1) => Some(SlsVariant::Moon32),
-            Some(2) => Some(SlsVariant::Moon64),
-            _ => None,
-        }
-    } else {
-        None
-    };
-    let lumen_installed = home.join(".local/share/Lumen/lumen").is_file();
-    let luatools_installed = home.join(".local/share/Lumen/luatools").is_dir();
-    let slssteam_64_version = fs::read_to_string(home.join(".cache/steamrollbackr/sls64_version"))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    let mut out = LumenVersions {
-        slssteam_installed,
-        slssteam_variant,
-        slssteam_64_version,
-        lumen_installed,
-        luatools_installed,
-        ..Default::default()
-    };
-
-    let versions_path = home.join(".local/share/Lumen/versions.json");
-    if let Ok(content) = fs::read_to_string(versions_path) {
-        if let Ok(parsed) = serde_json::from_str::<LumenVersionsJson>(&content) {
-            out.slsteam_moon = parsed.slsteam_moon.and_then(|c| c.tag);
-            out.lumen = parsed.lumen.and_then(|c| c.tag);
-            out.luatools = parsed.plugin.and_then(|c| c.tag);
-        }
-    }
-    out
-}
-
 #[derive(Debug, Clone)]
 pub struct DistroInfo {
     pub id: String,
@@ -162,45 +65,6 @@ pub struct SteamStatus {
     pub distro: DistroInfo,
     pub current_version: Option<ClientVersion>,
     pub lock_state: LockState,
-    pub lumen_versions: LumenVersions,
-    pub sim_has_rt64: Option<bool>,
-    pub sim_has_u12: Option<bool>,
-}
-
-impl SteamStatus {
-    pub fn has_steamrt64_client(&self) -> bool {
-        if let Some(v) = self.sim_has_rt64 {
-            return v;
-        }
-        self.steam_dir
-            .as_ref()
-            .is_some_and(|d| d.join("steamrt64/steamclient.so").is_file())
-    }
-
-    pub fn has_ubuntu12_client(&self) -> bool {
-        if let Some(v) = self.sim_has_u12 {
-            return v;
-        }
-        self.steam_dir
-            .as_ref()
-            .is_some_and(|d| d.join("ubuntu12_32/steamclient.so").is_file())
-    }
-
-    /// Returns the active SLSsteam variant: installed ELF class takes priority,
-    /// then saved preference, then `Moon64` if `steamrt64` is present, else `Moon32`.
-    pub fn active_sls_variant(&self) -> SlsVariant {
-        if let Some(installed) = self.lumen_versions.slssteam_variant {
-            return installed;
-        }
-        if let Some(pref) = read_preferred_sls_variant() {
-            return pref;
-        }
-        if self.has_steamrt64_client() {
-            SlsVariant::Moon64
-        } else {
-            SlsVariant::Moon32
-        }
-    }
 }
 
 pub fn parse_os_release(content: &str) -> (String, String, bool) {
@@ -359,7 +223,6 @@ pub fn inspect_steam_with_override(override_dir: Option<&Path>) -> SteamStatus {
         Some(_) => None,
         None => find_steam_dir(),
     };
-    let lumen_versions = read_lumen_versions();
     let distro = detect_distro();
     match steam_dir {
         Some(dir) => {
@@ -372,9 +235,6 @@ pub fn inspect_steam_with_override(override_dir: Option<&Path>) -> SteamStatus {
                 distro,
                 current_version,
                 lock_state,
-                lumen_versions,
-                sim_has_rt64: None,
-                sim_has_u12: None,
             }
         }
         None => SteamStatus {
@@ -383,9 +243,6 @@ pub fn inspect_steam_with_override(override_dir: Option<&Path>) -> SteamStatus {
             distro,
             current_version: None,
             lock_state: LockState::Unlocked,
-            lumen_versions,
-            sim_has_rt64: None,
-            sim_has_u12: None,
         },
     }
 }
@@ -482,26 +339,6 @@ fn build_steam_launcher_candidates(
     out
 }
 
-/// Builds a distro- and sandbox-aware Steam launch command with clean environment
-/// (no `LD_AUDIT`, `LD_PRELOAD`, or `~/.local/share/SLSsteam/path` in `PATH`).
-fn build_clean_steam_command(
-    steam_dir: &Path,
-    extra_args: &[&str],
-) -> Result<(Command, String), String> {
-    let (mut cmd, desc) = build_steam_command(steam_dir, extra_args)?;
-    cmd.env_remove("LD_AUDIT");
-    cmd.env_remove("LD_PRELOAD");
-    if let Some(path_val) = std::env::var_os("PATH") {
-        let filtered: Vec<PathBuf> = std::env::split_paths(&path_val)
-            .filter(|p| !p.to_string_lossy().contains(".local/share/SLSsteam"))
-            .collect();
-        if let Ok(joined) = std::env::join_paths(filtered) {
-            cmd.env("PATH", joined);
-        }
-    }
-    Ok((cmd, desc))
-}
-
 /// Builds a distro- and sandbox-aware Steam launch command.
 fn build_steam_command(steam_dir: &Path, extra_args: &[&str]) -> Result<(Command, String), String> {
     if is_flatpak_steam_dir(steam_dir) {
@@ -590,31 +427,7 @@ fn cleanup_conflicting_files(steam_dir: &Path, target_channel: ManifestChannel, 
         }
     }
 
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        let slsteam_dir = home.join(".local/state/slsteam-moon");
-        if let Ok(entries) = fs::read_dir(&slsteam_dir) {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if name.starts_with("safe_mode") {
-                        let _ = fs::remove_file(entry.path());
-                    }
-                }
-            }
-        }
-    }
-    log(&format!("Cleaned conflicting {prefix_to_remove}* and safe_mode files."));
-}
-
-fn reset_slsteam_boot_count(log: &mut dyn FnMut(&str)) {
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        let slsteam_dir = home.join(".local/state/slsteam-moon");
-        if slsteam_dir.is_dir() {
-            let boot_fail = slsteam_dir.join("boot_fail_count");
-            if fs::write(&boot_fail, "0\n").is_ok() {
-                log("Reset slsteam-moon boot_fail_count to 0.");
-            }
-        }
-    }
+    log(&format!("Cleaned conflicting {prefix_to_remove}* files."));
 }
 
 pub fn lock_only(steam_dir: &Path, log: &mut dyn FnMut(&str)) -> Result<(), String> {
@@ -622,7 +435,6 @@ pub fn lock_only(steam_dir: &Path, log: &mut dyn FnMut(&str)) -> Result<(), Stri
     write_lock_cfg(steam_dir)?;
     log("Setting package/ directory to read-only (chmod a-w)...");
     set_package_writable(steam_dir, false)?;
-    reset_slsteam_boot_count(log);
     log("SUCCESS! Steam updates are now locked.");
     Ok(())
 }
@@ -660,19 +472,7 @@ pub fn unlock_and_update_steam(steam_dir: &Path, log: &mut dyn FnMut(&str)) -> R
         Err(e) => return Err(format!("Failed to run Steam updater: {e}")),
     }
 
-    reset_slsteam_boot_count(log);
     log("SUCCESS! Steam has been unlocked and updated to the latest release.");
-    Ok(())
-}
-
-/// Restarts the Steam client cleanly.
-pub fn restart_steam(steam_dir: &Path, log: &mut dyn FnMut(&str)) -> Result<(), String> {
-    kill_steam(log);
-    let (mut cmd, launcher_desc) = build_steam_command(steam_dir, &[])?;
-    log(&format!("Starting Steam via {launcher_desc}..."));
-    cmd.spawn()
-        .map_err(|e| format!("Failed to start Steam: {e}"))?;
-    log("Steam launched.");
     Ok(())
 }
 
@@ -824,361 +624,6 @@ pub fn uninstall_libcrypto3(steam_dir: &Path, log: &mut dyn FnMut(&str)) -> Resu
     Ok(())
 }
 
-/// Checks if mrpinkguyjp's luatools-linux is installed under ~/.local/bin/luatools.
-pub fn is_luatools_linux_installed() -> bool {
-    std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join(".local/bin/luatools").is_file())
-        .unwrap_or(false)
-}
-
-/// Returns which luatools-moon fork ("rafie" or "swwayps") was installed via SteamRollbackr.
-pub fn read_luatools_moon_fork() -> Option<String> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    let path = home.join(".cache/steamrollbackr/luatools_moon_fork");
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-pub const SLS64_INSTALL_CMD: &str = "curl -fsSL https://raw.githubusercontent.com/foodiemonster/slssteam-moon-64/main/install-over-luatools.sh | bash && mkdir -p \"$HOME/.cache/steamrollbackr\" && printf moon64 > \"$HOME/.cache/steamrollbackr/sls_variant\" && tag=$(curl -fsSL https://api.github.com/repos/foodiemonster/slssteam-moon-64/releases/latest | grep -m1 '\"tag_name\"' | cut -d'\"' -f4 || true) && ([ -n \"$tag\" ] && printf '%s' \"$tag\" > \"$HOME/.cache/steamrollbackr/sls64_version\" || true)";
-
-pub const SLS32_INSTALL_CMD: &str = "set -euo pipefail; TMP=$(mktemp -d); trap 'rm -rf \"$TMP\"' EXIT; URL=$(curl -fsSL https://api.github.com/repos/swwayps/slsteam-moon/releases/latest | grep -Eo 'https://[^\"]+\\.zip' | head -n 1); curl -fL \"$URL\" -o \"$TMP/sls32.zip\"; unzip -q \"$TMP/sls32.zip\" -d \"$TMP/ext\"; ROOT=$(find \"$TMP/ext\" -maxdepth 2 -name setup.sh -printf '%h\\n' | head -n 1); (cd \"$ROOT\" && ./setup.sh install < /dev/null); mkdir -p \"$HOME/.cache/steamrollbackr\"; printf moon32 > \"$HOME/.cache/steamrollbackr/sls_variant\"; rm -f \"$HOME/.cache/steamrollbackr/sls64_version\"";
-
-/// Reads the user's preferred SLSsteam variant from `~/.cache/steamrollbackr/sls_variant`.
-pub fn read_preferred_sls_variant() -> Option<SlsVariant> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    let path = home.join(".cache/steamrollbackr/sls_variant");
-    let content = std::fs::read_to_string(path).ok()?;
-    SlsVariant::from_cache_str(&content)
-}
-
-pub fn is_64bit_migration_dismissed() -> bool {
-    std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join(".cache/steamrollbackr/dismiss_64_migration").is_file())
-        .unwrap_or(false)
-}
-
-pub fn dismiss_64bit_migration() {
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        let dir = home.join(".cache/steamrollbackr");
-        let _ = fs::create_dir_all(&dir);
-        let _ = fs::write(dir.join("dismiss_64_migration"), "1");
-    }
-}
-
-fn stop_slssteam_guardians(home: &Path, log: &mut dyn FnMut(&str)) {
-    let unit_dir = home.join(".config/systemd/user");
-    let mut removed_any = false;
-    if let Ok(entries) = fs::read_dir(&unit_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            let lower = name.to_ascii_lowercase();
-            if (lower.contains("slsteam") || lower.contains("slssteam"))
-                && (lower.ends_with(".service")
-                    || lower.ends_with(".path")
-                    || lower.ends_with(".timer"))
-            {
-                let _ = Command::new("systemctl")
-                    .args(["--user", "stop", name])
-                    .status();
-                let _ = Command::new("systemctl")
-                    .args(["--user", "disable", name])
-                    .status();
-                if fs::remove_file(&path).is_ok() {
-                    removed_any = true;
-                }
-                log(&format!("Stopped and removed guardian unit: {name}"));
-            }
-        }
-    }
-    if removed_any {
-        let _ = Command::new("systemctl")
-            .args(["--user", "daemon-reload"])
-            .status();
-        let _ = Command::new("systemctl")
-            .args(["--user", "reset-failed"])
-            .status();
-    }
-}
-
-fn kill_lumen(log: &mut dyn FnMut(&str)) {
-    log("Stopping any running Lumen processes...");
-    let _ = Command::new("pkill").args(["-9", "-x", "lumen"]).status();
-}
-
-fn restore_patched_desktop_files(home: &Path, log: &mut dyn FnMut(&str)) {
-    let backup_dir = home.join(".local/share/SLSsteam/backup");
-    let mut dirs = vec![home.join(".config/autostart")];
-    if let Some(xdg_data) = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from) {
-        dirs.push(xdg_data.join("applications"));
-    } else {
-        dirs.push(home.join(".local/share/applications"));
-    }
-
-    for dir in dirs {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if !name.ends_with(".desktop") {
-                continue;
-            }
-            let Ok(content) = fs::read_to_string(&path) else {
-                continue;
-            };
-            if !content.contains("X-SLSteamMoon-Patched=true") {
-                continue;
-            }
-
-            let backup_candidate = backup_dir.join(name);
-            if backup_candidate.is_file() {
-                if fs::copy(&backup_candidate, &path).is_ok() {
-                    log(&format!("Restored desktop entry from backup: {name}"));
-                    continue;
-                }
-            }
-
-            let cleaned: Vec<String> = content
-                .lines()
-                .filter(|line| line.trim() != "X-SLSteamMoon-Patched=true")
-                .map(|line| {
-                    if let Some(rest) = line.strip_prefix("Exec=") {
-                        if rest.contains(".local/share/SLSsteam/path/steam") {
-                            let args = rest
-                                .split_once(".local/share/SLSsteam/path/steam")
-                                .map(|(_, tail)| tail)
-                                .unwrap_or("");
-                            return format!("Exec=steam{args}");
-                        }
-                    }
-                    line.to_string()
-                })
-                .collect();
-            let _ = fs::write(&path, format!("{}\n", cleaned.join("\n")));
-            log(&format!("Unhooked patched desktop entry: {name}"));
-        }
-    }
-}
-
-fn sanitize_steam_package_dir(steam_dir: &Path, log: &mut dyn FnMut(&str)) -> Result<(), String> {
-    let pkg = steam_dir.join("package");
-    if pkg.is_dir() {
-        let _ = Command::new("chmod").args(["-R", "u+rwX"]).arg(&pkg).status();
-        set_package_writable(steam_dir, true)?;
-        if let Ok(entries) = fs::read_dir(&pkg) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
-                    continue;
-                };
-                if name.starts_with("steam_client_ubuntu12")
-                    || name.ends_with(".tmp")
-                    || name.contains(".zip.vz")
-                    || name.ends_with(".installed")
-                {
-                    let _ = fs::remove_file(&p);
-                }
-            }
-        }
-        log("Sanitized Steam package/ directory (removed legacy ubuntu12 & stale update markers).");
-    }
-
-    let libcrypto = steam_dir.join("ubuntu12_32/libcrypto.so.3");
-    if libcrypto.is_file() || fs::symlink_metadata(&libcrypto).is_ok() {
-        let _ = fs::remove_file(&libcrypto);
-        log("Removed legacy ubuntu12_32/libcrypto.so.3.");
-    }
-    Ok(())
-}
-
-struct CleanPreState {
-    home: PathBuf,
-    luatools_fork: Option<String>,
-}
-
-/// Phases 1-4: stops Steam/Lumen/guardians, removes all SLSsteam/Lumen/LuaTools binaries
-/// and `.desktop` hooks, sanitizes Steam's `package/`, and runs a clean `steamrt64` update.
-/// Preserves `steamapps/`, `userdata/`, `config/`, and `~/.config/SLSsteam/`.
-fn cleanup_and_update_vanilla_steam(
-    steam_dir: Option<&Path>,
-    log: &mut dyn FnMut(&str),
-) -> Result<CleanPreState, String> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| "HOME environment variable is not set.".to_string())?;
-
-    // Phase 1: Stop Steam, Lumen & guardian units
-    log("Phase 1: Stopping Steam, Lumen, and SLSsteam guardian units...");
-    kill_steam(log);
-    kill_lumen(log);
-    stop_slssteam_guardians(&home, log);
-
-    // Phase 2: Unhook wrappers and clean old tooling binaries (preserve ~/.config/SLSsteam/)
-    log("Phase 2: Cleaning SLSsteam/Lumen/LuaTools binaries (preserving ~/.config/SLSsteam/)...");
-    let luatools_fork = read_luatools_moon_fork();
-    restore_patched_desktop_files(&home, log);
-
-    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
-        let sls_runtime = runtime_dir.join("SLSsteam");
-        if sls_runtime.exists() {
-            let _ = fs::remove_dir_all(&sls_runtime);
-            log(&format!("Cleaned runtime dir {}", sls_runtime.display()));
-        }
-    }
-
-    for dir in [
-        home.join(".local/share/SLSsteam"),
-        home.join(".local/state/slsteam-moon"),
-        home.join(".local/share/Lumen"),
-    ] {
-        if dir.exists() {
-            fs::remove_dir_all(&dir)
-                .map_err(|e| format!("Failed to clean {}: {e}", dir.display()))?;
-            log(&format!("Removed {}", dir.display()));
-        }
-    }
-
-    // Phase 3 & 4: Unlock, sanitize Steam installation & run clean vanilla steamrt64 update
-    if let Some(dir) = steam_dir {
-        log("Phase 3: Unlocking and sanitizing Steam installation (preserving games & accounts)...");
-        unlock_updates(dir, log)?;
-        sanitize_steam_package_dir(dir, log)?;
-
-        log("Phase 4: Running clean vanilla Steam update to steamrt64...");
-        let (mut cmd, launcher_desc) = build_clean_steam_command(
-            dir,
-            &["-forcemanifestsuffix", "steamrt64", "-forcesteamupdate", "-exitsteam"],
-        )?;
-        log(&format!("Updating Steam via {launcher_desc}..."));
-        let status = cmd
-            .status()
-            .map_err(|e| format!("Failed to run Steam updater: {e}"))?;
-        log(&format!("Steam updater exited with status: {status}"));
-
-        if !dir.join("steamrt64/steamclient.so").is_file()
-            || !dir.join("steamrt64/steamui.so").is_file()
-        {
-            return Err(
-                "steamrt64 client files were not found after updating Steam. Launch Steam once normally to finish updating, then retry."
-                    .to_string(),
-            );
-        }
-    }
-
-    Ok(CleanPreState {
-        home,
-        luatools_fork,
-    })
-}
-
-/// Removes all SLSsteam/Lumen/LuaTools installations and restores latest vanilla `steamrt64` Steam.
-pub fn full_uninstall_to_vanilla_steam(
-    steam_dir: Option<&Path>,
-    log: &mut dyn FnMut(&str),
-) -> Result<(), String> {
-    let state = cleanup_and_update_vanilla_steam(steam_dir, log)?;
-
-    let standalone_lt = state.home.join(".local/bin/luatools");
-    if standalone_lt.exists() || fs::symlink_metadata(&standalone_lt).is_ok() {
-        let _ = fs::remove_file(&standalone_lt);
-        log("Removed ~/.local/bin/luatools.");
-    }
-
-    let cache_dir = state.home.join(".cache/steamrollbackr");
-    for name in ["sls_variant", "sls64_version", "luatools_moon_fork"] {
-        let _ = fs::remove_file(cache_dir.join(name));
-    }
-
-    log("SUCCESS! All tools removed and Steam is updated to vanilla steamrt64.");
-    Ok(())
-}
-
-/// Clean-slate migration/reinstall to `steamrt64` + `slssteam-moon-64`.
-/// Preserves `steamapps/`, `userdata/`, `config/`, and `~/.config/SLSsteam/`.
-pub fn migrate_to_slssteam_64(
-    steam_dir: Option<&Path>,
-    log: &mut dyn FnMut(&str),
-) -> Result<(), String> {
-    let state = cleanup_and_update_vanilla_steam(steam_dir, log)?;
-
-    // Phase 5: Fresh reinstall of LuaTools + Lumen and slssteam-moon-64
-    log("Phase 5: Installing fresh LuaTools, Lumen & slssteam-moon-64...");
-    let (fork_name, install_url) = match state.luatools_fork.as_deref() {
-        Some("swwayps") => (
-            "swwayps",
-            "https://raw.githubusercontent.com/swwayps/luatools-moon/main/install.sh",
-        ),
-        _ => (
-            "rafie",
-            "https://raw.githubusercontent.com/Rafie-kun/luatools-moon/main/install.sh",
-        ),
-    };
-    log(&format!("Installing LuaTools & Lumen ({fork_name})..."));
-    let cmd = format!(
-        "curl -fsSL {install_url} | bash && mkdir -p \"$HOME/.cache/steamrollbackr\" && printf {fork_name} > \"$HOME/.cache/steamrollbackr/luatools_moon_fork\""
-    );
-    run_shell_command(&cmd, log)?;
-    // Ensure any daemon/guardian started by LuaTools' 32-bit setup.sh is stopped before 64-bit overlay
-    kill_lumen(log);
-    stop_slssteam_guardians(&state.home, log);
-
-    run_shell_command(SLS64_INSTALL_CMD, log)?;
-
-    let _ = Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .status();
-
-    let sls_so = state.home.join(".local/share/SLSsteam/SLSsteam.so");
-    if elf_class(&sls_so) != Some(2) {
-        return Err("Post-install check failed: SLSsteam.so is not ELF64.".to_string());
-    }
-
-    log("SUCCESS! Clean 64-bit Steam + slssteam-moon-64 setup is ready.");
-    Ok(())
-}
-
-/// Runs a shell command via `sh -c` and streams combined output lines to `log`.
-pub fn run_shell_command(cmd: &str, log: &mut dyn FnMut(&str)) -> Result<(), String> {
-    use std::io::{BufRead, BufReader};
-    use std::process::Stdio;
-
-    log(&format!("Running: {cmd}"));
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(format!("{cmd} 2>&1"))
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to launch shell command: {e}"))?;
-
-    if let Some(stdout) = child.stdout.take() {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            let trimmed = line.trim();
-            if !trimmed.is_empty() {
-                log(trimmed);
-            }
-        }
-    }
-
-    let status = child
-        .wait()
-        .map_err(|e| format!("Failed waiting for command: {e}"))?;
-    if status.success() {
-        log("Command completed successfully.");
-        Ok(())
-    } else {
-        Err(format!("Command exited with status: {status}"))
-    }
-}
-
 /// Rolls back Steam to a specific manifest (served via local HTTP server) and locks updates.
 pub fn rollback_to_manifest(
     steam_dir: &Path,
@@ -1188,7 +633,7 @@ pub fn rollback_to_manifest(
 ) -> Result<(), String> {
     let distro = detect_distro();
     if distro.in_steamos_gaming_mode {
-        log("WARNING: SteamOS Gaming Mode detected. Please run SteamRollbackr from Desktop Mode so Gamescope does not restart Steam during rollback.");
+        log("WARNING: SteamOS Gaming Mode detected. Please run SteamRollbackrLite from Desktop Mode so Gamescope does not restart Steam during rollback.");
     }
 
     let millennium_detected = has_millennium(steam_dir);
@@ -1305,7 +750,7 @@ mod tests {
 
     #[test]
     fn test_lock_state_detection() {
-        let tmp = std::env::temp_dir().join(format!("steamrollbackr_test_{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("steamrollbackr-lite_test_{}", std::process::id()));
         let pkg = tmp.join("package");
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&pkg).unwrap();
@@ -1372,7 +817,7 @@ mod tests {
 
     #[test]
     fn test_launcher_candidate_priority() {
-        let tmp = std::env::temp_dir().join(format!("steamrollbackr_launch_{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("steamrollbackr-lite_launch_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(tmp.join("ubuntu12_32")).unwrap();
         fs::create_dir_all(tmp.join("linux32")).unwrap();
@@ -1397,7 +842,7 @@ mod tests {
 
     #[test]
     fn test_is_elf32() {
-        let tmp = std::env::temp_dir().join(format!("steamrollbackr_elf_{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("steamrollbackr-lite_elf_{}", std::process::id()));
         fs::write(&tmp, [0x7F, b'E', b'L', b'F', 1, 1, 1, 0]).unwrap();
         assert!(is_elf32(&tmp));
         fs::write(&tmp, [0x7F, b'E', b'L', b'F', 2, 1, 1, 0]).unwrap();

@@ -26,7 +26,7 @@ jobs:
             VER="${GITHUB_REF_NAME#v}"
             sed -i "s/^version = .*/version = \"${VER}\"/" Cargo.toml
           else
-            VER="0.5.2"
+            VER="0.1.0"
           fi
           echo "version=$VER" >> "$GITHUB_OUTPUT"
 
@@ -39,12 +39,12 @@ jobs:
       - name: Build tarball
         run: |
           mkdir -p dist/pkg
-          cp target/release/steamrollbackr dist/pkg/
-          cp packaging/steamrollbackr.desktop dist/pkg/
-          cp packaging/steamrollbackr.png dist/pkg/
+          cp target/release/steamrollbackr-lite dist/pkg/
+          cp packaging/steamrollbackr-lite.desktop dist/pkg/
+          cp packaging/steamrollbackr-lite.png dist/pkg/
           cp install.sh dist/pkg/
           cp README.md dist/pkg/
-          tar -czf dist/steamrollbackr-linux-x86_64.tar.gz -C dist/pkg .
+          tar -czf dist/steamrollbackr-lite-linux-x86_64.tar.gz -C dist/pkg .
           rm -rf dist/pkg
 
       - name: Build .deb package
@@ -55,11 +55,11 @@ jobs:
                    "$DEB_DIR/usr/bin" \
                    "$DEB_DIR/usr/share/applications" \
                    "$DEB_DIR/usr/share/icons/hicolor/256x256/apps"
-          install -Dm755 target/release/steamrollbackr "$DEB_DIR/usr/bin/steamrollbackr"
-          install -Dm644 packaging/steamrollbackr.desktop "$DEB_DIR/usr/share/applications/steamrollbackr.desktop"
-          install -Dm644 packaging/steamrollbackr.png "$DEB_DIR/usr/share/icons/hicolor/256x256/apps/steamrollbackr.png"
+          install -Dm755 target/release/steamrollbackr-lite "$DEB_DIR/usr/bin/steamrollbackr-lite"
+          install -Dm644 packaging/steamrollbackr-lite.desktop "$DEB_DIR/usr/share/applications/steamrollbackr-lite.desktop"
+          install -Dm644 packaging/steamrollbackr-lite.png "$DEB_DIR/usr/share/icons/hicolor/256x256/apps/steamrollbackr-lite.png"
           cat > "$DEB_DIR/DEBIAN/control" <<EOF
-          Package: steamrollbackr
+          Package: steamrollbackr-lite
           Version: $VER
           Section: utils
           Priority: optional
@@ -67,7 +67,7 @@ jobs:
           Maintainer: foodiemonster
           Description: Cross-distro Linux GUI utility to roll back the Steam client and lock/unlock updates
           EOF
-          dpkg-deb --build "$DEB_DIR" "dist/steamrollbackr_${VER}_amd64.deb"
+          dpkg-deb --build "$DEB_DIR" "dist/steamrollbackr-lite_${VER}_amd64.deb"
           rm -rf "$DEB_DIR"
 
       - name: Build .rpm package
@@ -77,8 +77,8 @@ jobs:
           VER="${{ steps.ver.outputs.version }}"
           RPM_TOP="$(pwd)/dist/rpmbuild"
           mkdir -p "$RPM_TOP"/{BUILD,RPMS,SOURCES,SPECS,SRPMS,BUILDROOT}
-          cat > "$RPM_TOP/SPECS/steamrollbackr.spec" <<EOF
-          Name:           steamrollbackr
+          cat > "$RPM_TOP/SPECS/steamrollbackr-lite.spec" <<EOF
+          Name:           steamrollbackr-lite
           Version:        $VER
           Release:        1
           Summary:        Roll back the Steam Linux client and lock/unlock updates
@@ -90,17 +90,17 @@ jobs:
           Cross-distro Linux GUI utility to roll back the Steam client and lock/unlock updates.
 
           %install
-          install -Dm755 $(pwd)/target/release/steamrollbackr %{buildroot}/usr/bin/steamrollbackr
-          install -Dm644 $(pwd)/packaging/steamrollbackr.desktop %{buildroot}/usr/share/applications/steamrollbackr.desktop
-          install -Dm644 $(pwd)/packaging/steamrollbackr.png %{buildroot}/usr/share/icons/hicolor/256x256/apps/steamrollbackr.png
+          install -Dm755 $(pwd)/target/release/steamrollbackr-lite %{buildroot}/usr/bin/steamrollbackr-lite
+          install -Dm644 $(pwd)/packaging/steamrollbackr-lite.desktop %{buildroot}/usr/share/applications/steamrollbackr-lite.desktop
+          install -Dm644 $(pwd)/packaging/steamrollbackr-lite.png %{buildroot}/usr/share/icons/hicolor/256x256/apps/steamrollbackr-lite.png
 
           %files
-          /usr/bin/steamrollbackr
-          /usr/share/applications/steamrollbackr.desktop
-          /usr/share/icons/hicolor/256x256/apps/steamrollbackr.png
+          /usr/bin/steamrollbackr-lite
+          /usr/share/applications/steamrollbackr-lite.desktop
+          /usr/share/icons/hicolor/256x256/apps/steamrollbackr-lite.png
           EOF
-          rpmbuild --define "_topdir $RPM_TOP" -bb "$RPM_TOP/SPECS/steamrollbackr.spec"
-          cp "$RPM_TOP/RPMS/x86_64/steamrollbackr-${VER}-1.x86_64.rpm" dist/
+          rpmbuild --define "_topdir $RPM_TOP" -bb "$RPM_TOP/SPECS/steamrollbackr-lite.spec"
+          cp "$RPM_TOP/RPMS/x86_64/steamrollbackr-lite-${VER}-1.x86_64.rpm" dist/
           rm -rf "$RPM_TOP"
 
       - name: Build .AppImage
@@ -108,20 +108,20 @@ jobs:
           VER="${{ steps.ver.outputs.version }}"
           APP_DIR="dist/AppDir"
           mkdir -p "$APP_DIR/usr/bin"
-          install -Dm755 target/release/steamrollbackr "$APP_DIR/usr/bin/steamrollbackr"
-          install -Dm644 packaging/steamrollbackr.desktop "$APP_DIR/steamrollbackr.desktop"
-          install -Dm644 packaging/steamrollbackr.png "$APP_DIR/steamrollbackr.png"
-          ln -sf steamrollbackr.png "$APP_DIR/.DirIcon"
+          install -Dm755 target/release/steamrollbackr-lite "$APP_DIR/usr/bin/steamrollbackr-lite"
+          install -Dm644 packaging/steamrollbackr-lite.desktop "$APP_DIR/steamrollbackr-lite.desktop"
+          install -Dm644 packaging/steamrollbackr-lite.png "$APP_DIR/steamrollbackr-lite.png"
+          ln -sf steamrollbackr-lite.png "$APP_DIR/.DirIcon"
           cat > "$APP_DIR/AppRun" <<'EOF'
           #!/bin/sh
           HERE="$(dirname "$(readlink -f "$0")")"
-          exec "$HERE/usr/bin/steamrollbackr" "$@"
+          exec "$HERE/usr/bin/steamrollbackr-lite" "$@"
           EOF
           chmod +x "$APP_DIR/AppRun"
 
           curl -fsSL "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage" -o dist/appimagetool
           chmod +x dist/appimagetool
-          ARCH=x86_64 dist/appimagetool --appimage-extract-and-run "$APP_DIR" "dist/SteamRollbackr-${VER}-x86_64.AppImage"
+          ARCH=x86_64 dist/appimagetool --appimage-extract-and-run "$APP_DIR" "dist/SteamRollbackrLite-${VER}-x86_64.AppImage"
           rm -rf "$APP_DIR" dist/appimagetool
 
       - name: Create or update GitHub Release
@@ -129,8 +129,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/steamrollbackr-linux-x86_64.tar.gz
-            dist/steamrollbackr_*.deb
-            dist/steamrollbackr-*.rpm
-            dist/SteamRollbackr-*-x86_64.AppImage
+            dist/steamrollbackr-lite-linux-x86_64.tar.gz
+            dist/steamrollbackr-lite_*.deb
+            dist/steamrollbackr-lite-*.rpm
+            dist/SteamRollbackrLite-*-x86_64.AppImage
           generate_release_notes: true

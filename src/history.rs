@@ -36,10 +36,10 @@ struct CommitAuthor {
 fn cache_dir() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
         if !xdg.is_empty() {
-            return Some(PathBuf::from(xdg).join("steamrollbackr"));
+            return Some(PathBuf::from(xdg).join("steamrollbackr-lite"));
         }
     }
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache/steamrollbackr"))
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache/steamrollbackr-lite"))
 }
 
 pub fn read_cache(key: &str, max_age: Duration) -> Option<String> {
@@ -141,7 +141,7 @@ fn fetch_releases_atom(channel: ManifestChannel) -> Result<Vec<ReleaseEntry>, St
             channel.filename()
         );
         match ureq::get(&url)
-            .set("User-Agent", "SteamRollbackr/0.3")
+            .set("User-Agent", "SteamRollbackrLite/0.3")
             .call()
             .and_then(|r| r.into_string().map_err(|e| ureq::Error::from(e)))
         {
@@ -194,7 +194,7 @@ pub fn fetch_releases(channel: ManifestChannel, page: u32) -> Result<Vec<Release
         );
 
         match ureq::get(&url)
-            .set("User-Agent", "SteamRollbackr/0.3")
+            .set("User-Agent", "SteamRollbackrLite/0.3")
             .set("Accept", "application/vnd.github+json")
             .call()
         {
@@ -255,7 +255,7 @@ pub fn fetch_manifest_content(
     );
 
     let resp = ureq::get(&url)
-        .set("User-Agent", "SteamRollbackr/0.3")
+        .set("User-Agent", "SteamRollbackrLite/0.3")
         .call()
         .map_err(|e| format!("Failed to download manifest ({sha}): {e}"))?;
 

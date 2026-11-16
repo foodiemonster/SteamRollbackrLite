@@ -4,19 +4,14 @@ use std::thread;
 
 use crate::history::{fetch_manifest_content, fetch_releases, ReleaseEntry};
 use crate::i18n::{draw_flag, texts, Language, Texts};
-use crate::slssteam::{
-    check_slsteam_moon, find_best_compatible_release, is_moon_update_available, SlsMoonStatus,
-};
 use crate::steam::{
-    dismiss_64bit_migration, full_uninstall_to_vanilla_steam, inspect_steam,
-    inspect_steam_with_override, install_libcrypto3, is_64bit_migration_dismissed,
-    is_luatools_linux_installed, lock_only, migrate_to_slssteam_64, restart_steam,
-    rollback_to_manifest, run_shell_command, uninstall_libcrypto3, unlock_and_update_steam,
-    unlock_updates, ClientVersion, LockState, ManifestChannel, SlsVariant, SteamStatus,
-    SLS32_INSTALL_CMD, SLS64_INSTALL_CMD,
+    inspect_steam, inspect_steam_with_override, install_libcrypto3, lock_only,
+    rollback_to_manifest, uninstall_libcrypto3, unlock_and_update_steam, unlock_updates,
+    LockState, ManifestChannel, SteamStatus,
 };
 use crate::updater::{
-    check_for_update, detect_install_kind, perform_update, InstallKind, UpdateInfo, UpdateOutcome,
+    check_for_update, detect_install_kind, install_app_user_local, is_app_installed_user_local,
+    perform_update, uninstall_app_user_local, InstallKind, UpdateInfo, UpdateOutcome,
     CURRENT_VERSION,
 };
 use std::path::PathBuf;
@@ -24,9 +19,9 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveTab {
     Home,
-    Advanced,
     Tools,
-    Troubleshooting,
+    Options,
+    HowToUse,
     Logs,
 }
 
@@ -36,43 +31,30 @@ enum BgEvent {
         page: u32,
         result: Result<Vec<ReleaseEntry>, String>,
     },
-    SlsMoonChecked(Result<SlsMoonStatus, String>),
-    OptimizeSelected {
-        channel: ManifestChannel,
-        releases: Vec<ReleaseEntry>,
-        selected_sha: String,
-    },
     Log(String),
     ActionFinished(Result<(), String>),
     AppUpdateChecked(Result<Option<UpdateInfo>, String>),
     AppUpdateFinished(Result<UpdateOutcome, String>),
 }
 
-pub struct SteamRollbackrApp {
+pub struct SteamRollbackrLiteApp {
     lang: Language,
     active_tab: ActiveTab,
     status: SteamStatus,
     steam_path_override: Option<PathBuf>,
     steam_path_input: String,
+    selected_channel: Option<ManifestChannel>,
     channel: ManifestChannel,
     releases: Vec<ReleaseEntry>,
     selected_idx: Option<usize>,
     details_entry: Option<ReleaseEntry>,
-    confirm_restart: bool,
     available_update: Option<UpdateInfo>,
     show_update_popup: bool,
     updating_app: bool,
-    show_tools_tip: bool,
-    dismiss_64_prompt: bool,
-    show_debug_menu: bool,
-    debug_sim_active: bool,
-    tools_btn_rect: Option<egui::Rect>,
     current_page: u32,
     has_more: bool,
     loading_releases: bool,
-    checking_moon: bool,
     refresh_spin_start: Option<std::time::Instant>,
-    moon_status: Option<Result<SlsMoonStatus, String>>,
     busy: bool,
     filter_text: String,
     logs: Vec<String>,
@@ -84,12 +66,11 @@ pub struct SteamRollbackrApp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SidebarIcon {
     Home,
-    Advanced,
     Tools,
-    Troubleshooting,
+    Options,
+    HowToUse,
     Logs,
     Refresh,
-    Restart,
 }
 
 fn apply_fluent_fonts(ctx: &egui::Context) {
@@ -211,14 +192,14 @@ fn draw_sidebar_icon(
                 s,
             );
         }
-        SidebarIcon::Advanced => {
-            // Three horizontal slider lines with knobs
-            for (dy, kx) in [(-4.0, -2.0), (0.0, 2.5), (4.0, -1.0)] {
-                painter.line_segment(
-                    [egui::pos2(x - 6.0, y + dy), egui::pos2(x + 6.0, y + dy)],
-                    s,
-                );
-                painter.circle_filled(egui::pos2(x + kx, y + dy), 1.8, color);
+        SidebarIcon::Options => {
+            // Gear icon
+            painter.circle_stroke(center, 3.6, s);
+            for i in 0..6 {
+                let a = (i as f32) * std::f32::consts::TAU / 6.0;
+                let p1 = egui::pos2(x + a.cos() * 3.8, y + a.sin() * 3.8);
+                let p2 = egui::pos2(x + a.cos() * 6.0, y + a.sin() * 6.0);
+                painter.line_segment([p1, p2], Stroke::new(1.7_f32, color));
             }
         }
         SidebarIcon::Tools => {
@@ -269,8 +250,8 @@ fn draw_sidebar_icon(
             // Bottom-right jaw opens toward +45 deg (0.25 * PI)
             draw_jaw(x + 3.9, y + 3.9, 0.25_f32 * std::f32::consts::PI);
         }
-        SidebarIcon::Troubleshooting => {
-            // Circle with question mark
+        SidebarIcon::HowToUse => {
+            // Question mark in a circle
             painter.circle_stroke(center, 6.0, s);
             painter.text(
                 egui::pos2(x, y + 0.5),
@@ -324,27 +305,6 @@ fn draw_sidebar_icon(
                 painter.line_segment([tip, rot(wing1_local.x, wing1_local.y)], arrow_stroke);
                 painter.line_segment([tip, rot(wing2_local.x, wing2_local.y)], arrow_stroke);
             }
-        }
-        SidebarIcon::Restart => {
-            // Single round circling arrow (like "Restart Steam")
-            let r = 5.2_f32;
-            let start = 0.28_f32;
-            let end = std::f32::consts::TAU - 0.62_f32;
-            let steps = 22;
-            let pts: Vec<egui::Pos2> = (0..=steps)
-                .map(|i| {
-                    let a = start + (end - start) * (i as f32 / steps as f32);
-                    egui::pos2(x + r * a.cos(), y + r * a.sin())
-                })
-                .collect();
-            let restart_stroke = Stroke::new(1.5_f32, color);
-            painter.add(egui::Shape::line(pts, restart_stroke));
-
-            let tx = x + r * end.cos();
-            let ty = y + r * end.sin();
-            let tip = egui::pos2(tx, ty);
-            painter.line_segment([tip, egui::pos2(tx, ty - 3.5)], restart_stroke);
-            painter.line_segment([tip, egui::pos2(tx - 3.5, ty)], restart_stroke);
         }
     }
 }
@@ -422,57 +382,7 @@ fn sidebar_item_spin(
     resp
 }
 
-fn draw_sparkle(painter: &egui::Painter, cx: f32, cy: f32, s: f32, m: f32, color: Color32) {
-    let pts_v = vec![
-        egui::pos2(cx, cy - s),
-        egui::pos2(cx + m, cy),
-        egui::pos2(cx, cy + s),
-        egui::pos2(cx - m, cy),
-    ];
-    let pts_h = vec![
-        egui::pos2(cx - s, cy),
-        egui::pos2(cx, cy - m),
-        egui::pos2(cx + s, cy),
-        egui::pos2(cx, cy + m),
-    ];
-    painter.add(egui::Shape::convex_polygon(pts_v, color, Stroke::NONE));
-    painter.add(egui::Shape::convex_polygon(pts_h, color, Stroke::NONE));
-}
-
-/// Draws a borderless square-with-outgoing-arrow external link icon.
-fn external_link_btn(ui: &mut egui::Ui, url: &str, hover: &str) {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(18.0, 18.0), egui::Sense::click());
-    let color = if resp.hovered() {
-        Color32::WHITE
-    } else {
-        Color32::from_rgb(160, 165, 175)
-    };
-    let s = Stroke::new(1.3_f32, color);
-    let b = rect.shrink(3.5);
-    // Open box (left, bottom, and partial top/right)
-    ui.painter().line_segment([b.left_top(), b.left_bottom()], s);
-    ui.painter().line_segment([b.left_bottom(), b.right_bottom()], s);
-    ui.painter().line_segment([b.left_top(), egui::pos2(b.center().x, b.top())], s);
-    ui.painter().line_segment([egui::pos2(b.right(), b.center().y), b.right_bottom()], s);
-    // Outgoing arrow top-right
-    ui.painter().line_segment([b.center(), b.right_top()], s);
-    ui.painter().line_segment([b.right_top(), egui::pos2(b.right() - 4.0, b.top())], s);
-    ui.painter().line_segment([b.right_top(), egui::pos2(b.right(), b.top() + 4.0)], s);
-
-    if resp.on_hover_text(hover).clicked() {
-        let _ = open_url(url);
-    }
-}
-
-fn open_url(url: &str) -> Result<(), String> {
-    std::process::Command::new("xdg-open")
-        .arg(url)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("Failed to open URL: {e}"))
-}
-
-impl SteamRollbackrApp {
+impl SteamRollbackrLiteApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         apply_fluent_dark_theme(&cc.egui_ctx);
 
@@ -498,25 +408,18 @@ impl SteamRollbackrApp {
             status,
             steam_path_override: None,
             steam_path_input,
+            selected_channel: None,
             channel: default_channel,
             releases: Vec::new(),
             selected_idx: None,
             details_entry: None,
-            confirm_restart: false,
             available_update: None,
             show_update_popup: false,
             updating_app: false,
-            show_tools_tip: Self::should_show_tools_tip(),
-            dismiss_64_prompt: is_64bit_migration_dismissed(),
-            show_debug_menu: std::env::var_os("STEAMROLLBACKR_DEBUG").is_some(),
-            debug_sim_active: false,
-            tools_btn_rect: None,
             current_page: 1,
             has_more: true,
             loading_releases: false,
-            checking_moon: false,
-            refresh_spin_start: Some(std::time::Instant::now()),
-            moon_status: None,
+            refresh_spin_start: None,
             busy: false,
             filter_text: String::new(),
             logs: vec![t.ready_log.to_string()],
@@ -524,38 +427,8 @@ impl SteamRollbackrApp {
             rx,
             tx,
         };
-        app.load_releases(1, true);
-        app.check_moon();
         app.check_app_update();
         app
-    }
-
-    fn tools_tip_marker_path() -> Option<PathBuf> {
-        std::env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join(".cache/steamrollbackr/seen_tools_notice_version"))
-    }
-
-    fn should_show_tools_tip() -> bool {
-        let Some(path) = Self::tools_tip_marker_path() else {
-            return false;
-        };
-        match std::fs::read_to_string(&path) {
-            Ok(ver) => ver.trim() != CURRENT_VERSION,
-            Err(_) => true,
-        }
-    }
-
-    fn dismiss_tools_tip(&mut self) {
-        if !self.show_tools_tip {
-            return;
-        }
-        self.show_tools_tip = false;
-        if let Some(path) = Self::tools_tip_marker_path() {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(path, CURRENT_VERSION);
-        }
     }
 
     fn set_language(&mut self, new_lang: Language) {
@@ -566,9 +439,6 @@ impl SteamRollbackrApp {
     }
 
     fn refresh_status(&mut self) {
-        if self.debug_sim_active {
-            return;
-        }
         self.status = inspect_steam_with_override(self.steam_path_override.as_deref());
         if self.steam_path_override.is_none() {
             self.steam_path_input = self
@@ -594,32 +464,13 @@ impl SteamRollbackrApp {
         };
         self.updating_app = true;
         self.initial_ready_only = false;
-        self.logs.push(format!("Starting SteamRollbackr update to {}...", info.latest_tag));
+        self.logs.push(format!("Starting SteamRollbackrLite update to {}...", info.latest_tag));
         let tx = self.tx.clone();
         thread::spawn(move || {
             let res = perform_update(&info, &mut |msg| {
                 let _ = tx.send(BgEvent::Log(msg.to_string()));
             });
             let _ = tx.send(BgEvent::AppUpdateFinished(res));
-        });
-    }
-
-    fn check_moon(&mut self) {
-        if self.checking_moon {
-            return;
-        }
-        self.checking_moon = true;
-        let variant = self.status.active_sls_variant();
-        let steam_dir = self.status.steam_dir.clone();
-        let local_client_ts = self
-            .status
-            .current_version
-            .as_ref()
-            .map(|v| v.version_id as i64);
-        let tx = self.tx.clone();
-        thread::spawn(move || {
-            let res = check_slsteam_moon(variant, steam_dir.as_deref(), local_client_ts);
-            let _ = tx.send(BgEvent::SlsMoonChecked(res));
         });
     }
 
@@ -773,137 +624,30 @@ impl SteamRollbackrApp {
         });
     }
 
-    fn start_shell_tool(&mut self, start_log: &str, cmd: &str) {
+    fn start_install_app_user_local(&mut self) {
         self.busy = true;
         self.initial_ready_only = false;
         self.logs.clear();
-        self.logs.push(start_log.to_string());
-        let cmd_owned = cmd.to_string();
+        self.logs.push("Installing SteamRollbackrLite to ~/.local...".to_string());
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let res = run_shell_command(&cmd_owned, &mut |msg| {
+            let res = install_app_user_local(&mut |msg| {
                 let _ = tx.send(BgEvent::Log(msg.to_string()));
             });
             let _ = tx.send(BgEvent::ActionFinished(res));
         });
     }
 
-    fn start_migrate_to_64(&mut self) {
-        let steam_dir = self.status.steam_dir.clone();
+    fn start_uninstall_app_user_local(&mut self) {
         self.busy = true;
         self.initial_ready_only = false;
         self.logs.clear();
-        self.logs
-            .push("Migrating Steam & SLSsteam to 64-bit (slssteam-moon-64)...".to_string());
+        self.logs.push("Removing SteamRollbackrLite from ~/.local...".to_string());
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let mut log_fn = |msg: &str| {
+            let res = uninstall_app_user_local(&mut |msg| {
                 let _ = tx.send(BgEvent::Log(msg.to_string()));
-            };
-            let res = migrate_to_slssteam_64(steam_dir.as_deref(), &mut log_fn);
-            let _ = tx.send(BgEvent::ActionFinished(res));
-        });
-    }
-
-    fn start_full_uninstall(&mut self) {
-        let steam_dir = self.status.steam_dir.clone();
-        self.busy = true;
-        self.initial_ready_only = false;
-        self.logs.clear();
-        self.logs
-            .push("Removing all tools and restoring vanilla steamrt64 Steam...".to_string());
-        let tx = self.tx.clone();
-        thread::spawn(move || {
-            let mut log_fn = |msg: &str| {
-                let _ = tx.send(BgEvent::Log(msg.to_string()));
-            };
-            let res = full_uninstall_to_vanilla_steam(steam_dir.as_deref(), &mut log_fn);
-            let _ = tx.send(BgEvent::ActionFinished(res));
-        });
-    }
-
-    fn start_restart_steam(&mut self) {
-        let Some(steam_dir) = self.status.steam_dir.clone() else {
-            return;
-        };
-        self.busy = true;
-        self.initial_ready_only = false;
-        self.logs.clear();
-        let tx = self.tx.clone();
-        thread::spawn(move || {
-            let mut log_fn = |msg: &str| {
-                let _ = tx.send(BgEvent::Log(msg.to_string()));
-            };
-            let res = restart_steam(&steam_dir, &mut log_fn);
-            let _ = tx.send(BgEvent::ActionFinished(res));
-        });
-    }
-
-    fn start_optimize(&mut self) {
-        let Some(steam_dir) = self.status.steam_dir.clone() else {
-            self.initial_ready_only = false;
-            self.logs.push("Error: Steam directory not found.".to_string());
-            return;
-        };
-        let variant = self.status.active_sls_variant();
-        let local_client_ts = self
-            .status
-            .current_version
-            .as_ref()
-            .map(|v| v.version_id as i64);
-        self.busy = true;
-        self.initial_ready_only = false;
-        self.logs.clear();
-        self.logs.push(format!(
-            "Checking latest {} compatible Steam release...",
-            variant.display_name()
-        ));
-
-        let tx = self.tx.clone();
-        thread::spawn(move || {
-            let mut log_fn = |msg: &str| {
-                let _ = tx.send(BgEvent::Log(msg.to_string()));
-            };
-            let res = match check_slsteam_moon(variant, Some(&steam_dir), local_client_ts) {
-                Ok(moon) => {
-                    log_fn(&format!(
-                        "{} pattern/release date: {}",
-                        variant.display_name(),
-                        moon.monitor_display
-                    ));
-                    match find_best_compatible_release(variant, moon.monitor_timestamp_utc) {
-                        Ok((best, list)) => {
-                            log_fn(&format!(
-                                "Auto-selected: [{}] {} ({})",
-                                best.channel.suffix(),
-                                best.date_display,
-                                best.short_sha
-                            ));
-                            let _ = tx.send(BgEvent::OptimizeSelected {
-                                channel: best.channel,
-                                releases: list,
-                                selected_sha: best.sha.clone(),
-                            });
-                            match fetch_manifest_content(&best.sha, best.channel) {
-                                Ok((manifest, ver)) => {
-                                    if let Some(v) = ver {
-                                        log_fn(&format!("Downloaded manifest version {v}."));
-                                    }
-                                    rollback_to_manifest(
-                                        &steam_dir,
-                                        best.channel,
-                                        &manifest,
-                                        &mut log_fn,
-                                    )
-                                }
-                                Err(e) => Err(e),
-                            }
-                        }
-                        Err(e) => Err(e),
-                    }
-                }
-                Err(e) => Err(e),
-            };
+            });
             let _ = tx.send(BgEvent::ActionFinished(res));
         });
     }
@@ -933,27 +677,6 @@ impl SteamRollbackrApp {
                         }
                     }
                 }
-                BgEvent::SlsMoonChecked(res) => {
-                    self.checking_moon = false;
-                    if let Err(ref e) = res {
-                        self.initial_ready_only = false;
-                        self.logs.push(format!("slsteam-moon check failed: {e}"));
-                    }
-                    if !self.debug_sim_active {
-                        self.moon_status = Some(res);
-                    }
-                }
-                BgEvent::OptimizeSelected {
-                    channel,
-                    releases,
-                    selected_sha,
-                } => {
-                    self.channel = channel;
-                    self.selected_idx = releases.iter().position(|r| r.sha == selected_sha);
-                    self.releases = releases;
-                    self.current_page = 1;
-                    self.has_more = true;
-                }
                 BgEvent::Log(msg) => {
                     self.initial_ready_only = false;
                     self.logs.push(msg);
@@ -965,7 +688,6 @@ impl SteamRollbackrApp {
                         self.logs.push(format!("ERROR: {e}"));
                     }
                     self.refresh_status();
-                    self.check_moon();
                 }
                 BgEvent::AppUpdateChecked(res) => {
                     if let Ok(Some(info)) = res {
@@ -1003,7 +725,7 @@ impl SteamRollbackrApp {
             )
             .show(ctx, |ui| {
                 ui.label(
-                    RichText::new("SteamRollbackr")
+                    RichText::new("SteamRollbackrLite")
                         .size(16.0)
                         .strong()
                         .color(Color32::WHITE),
@@ -1013,23 +735,13 @@ impl SteamRollbackrApp {
                 for (tab, icon, label) in [
                     (ActiveTab::Home, SidebarIcon::Home, t.nav_home),
                     (ActiveTab::Tools, SidebarIcon::Tools, t.nav_tools),
-                    (ActiveTab::Advanced, SidebarIcon::Advanced, t.nav_advanced),
-                    (
-                        ActiveTab::Troubleshooting,
-                        SidebarIcon::Troubleshooting,
-                        t.nav_troubleshooting,
-                    ),
+                    (ActiveTab::Options, SidebarIcon::Options, t.nav_options),
+                    (ActiveTab::HowToUse, SidebarIcon::HowToUse, t.nav_how_to_use),
                     (ActiveTab::Logs, SidebarIcon::Logs, t.nav_logs),
                 ] {
                     let resp = sidebar_item(ui, icon, label, self.active_tab == tab, true);
-                    if tab == ActiveTab::Tools {
-                        self.tools_btn_rect = Some(resp.rect);
-                    }
                     if resp.clicked() {
                         self.active_tab = tab;
-                        if tab == ActiveTab::Tools {
-                            self.dismiss_tools_tip();
-                        }
                     }
                     ui.add_space(2.0);
                 }
@@ -1108,21 +820,8 @@ impl SteamRollbackrApp {
                     );
 
                     ui.separator();
-                    let has_steam = self.status.steam_dir.is_some();
-                    if sidebar_item(
-                        ui,
-                        SidebarIcon::Restart,
-                        t.restart_steam,
-                        false,
-                        has_steam && !self.busy,
-                    )
-                    .clicked()
-                    {
-                        self.confirm_restart = true;
-                    }
-
                     let min_spin = 0.75_f32;
-                    let still_fetching = self.checking_moon || self.loading_releases;
+                    let still_fetching = self.loading_releases;
                     let spin_angle = if let Some(start) = self.refresh_spin_start {
                         let e = start.elapsed().as_secs_f32();
                         if still_fetching || e < min_spin {
@@ -1150,7 +849,6 @@ impl SteamRollbackrApp {
                     {
                         self.refresh_spin_start = Some(std::time::Instant::now());
                         self.refresh_status();
-                        self.check_moon();
                     }
                     ui.separator();
 
@@ -1182,1323 +880,95 @@ impl SteamRollbackrApp {
                             self.show_update_popup = true;
                         }
                     }
-
-                    if self.debug_sim_active {
-                        ui.add_space(6.0);
-                        let (rect, resp) = ui.allocate_exact_size(
-                            Vec2::new(ui.available_width(), 28.0),
-                            egui::Sense::click(),
-                        );
-                        let bg = if resp.hovered() {
-                            Color32::from_rgb(108, 66, 138)
-                        } else {
-                            Color32::from_rgb(84, 50, 110)
-                        };
-                        ui.painter().rect(
-                            rect,
-                            Rounding::same(6.0),
-                            bg,
-                            Stroke::new(1.0_f32, Color32::from_rgb(156, 108, 198)),
-                        );
-                        ui.painter().text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "SIM MODE (F12)",
-                            egui::FontId::proportional(12.0),
-                            Color32::from_rgb(235, 215, 255),
-                        );
-                        if resp.clicked() {
-                            self.show_debug_menu = true;
-                        }
-                    }
                 });
             });
-    }
-
-    fn apply_debug_preset(
-        &mut self,
-        variant: Option<SlsVariant>,
-        channel: ManifestChannel,
-        lock_state: LockState,
-        updated_for_latest: Option<bool>,
-        local_supported: Option<bool>,
-        luatools_installed: bool,
-        lumen_installed: bool,
-    ) {
-        self.debug_sim_active = true;
-        self.checking_moon = false;
-        self.dismiss_64_prompt = false;
-
-        if self.status.steam_dir.is_none() {
-            self.status.steam_dir = Some(PathBuf::from("/tmp/simulated-steam"));
-        }
-        let is_rt64 = channel == ManifestChannel::SteamRt64;
-        self.status.sim_has_rt64 = Some(is_rt64);
-        self.status.sim_has_u12 = Some(!is_rt64);
-        self.status.lock_state = lock_state;
-        self.status.current_version = Some(ClientVersion {
-            version_id: if is_rt64 { 1794536281 } else { 1761000000 },
-            formatted_date: if is_rt64 {
-                "2026-11-12 18:00:00".to_string()
-            } else {
-                "2026-10-20 12:00:00".to_string()
-            },
-            channel,
-        });
-
-        self.status.lumen_versions.slssteam_installed = variant.is_some();
-        self.status.lumen_versions.slssteam_variant = variant;
-        self.status.lumen_versions.slssteam_64_version = match variant {
-            Some(SlsVariant::Moon64) => Some("v3.0".to_string()),
-            _ => None,
-        };
-        self.status.lumen_versions.slsteam_moon = match variant {
-            Some(SlsVariant::Moon32) => Some("v2.9".to_string()),
-            _ => None,
-        };
-        self.status.lumen_versions.luatools_installed = luatools_installed;
-        self.status.lumen_versions.luatools = if luatools_installed {
-            Some("v1.8".to_string())
-        } else {
-            None
-        };
-        self.status.lumen_versions.lumen_installed = lumen_installed;
-        self.status.lumen_versions.lumen = if lumen_installed {
-            Some("v1.2".to_string())
-        } else {
-            None
-        };
-
-        let active_v = variant.unwrap_or_else(|| self.status.active_sls_variant());
-        self.moon_status = Some(Ok(SlsMoonStatus {
-            variant: active_v,
-            monitor_timestamp_utc: 1794670000,
-            monitor_display: "2026-11-14 16:20".to_string(),
-            moon_display: "2026-11-14 16:20".to_string(),
-            latest_moon_version: Some(match active_v {
-                SlsVariant::Moon64 => "slssteam-moon-64 v3.0".to_string(),
-                SlsVariant::Moon32 => "v2.9".to_string(),
-            }),
-            latest_steam_display: Some("2026-11-12 18:00".to_string()),
-            updated_for_latest_steam: updated_for_latest,
-            local_pattern_supported: local_supported,
-            local_steamclient_sha: Some("deadbeef".to_string()),
-        }));
-    }
-
-    fn render_debug_menu(&mut self, ctx: &egui::Context) {
-        let mut open = self.show_debug_menu;
-        egui::Window::new("Debug: UI State Simulator (F12)")
-            .open(&mut open)
-            .resizable(true)
-            .default_width(430.0)
-            .show(ctx, |ui| {
-                if self.debug_sim_active {
-                    egui::Frame::none()
-                        .fill(Color32::from_rgb(76, 46, 102))
-                        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(156, 108, 198)))
-                        .rounding(Rounding::same(6.0))
-                        .inner_margin(Margin::symmetric(10.0, 6.0))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.label(
-                                RichText::new("SIMULATION ACTIVE — UI is showing faked state.")
-                                    .strong()
-                                    .color(Color32::from_rgb(235, 215, 255)),
-                            );
-                        });
-                    ui.add_space(8.0);
-                }
-
-                ui.label(RichText::new("Quick Presets").strong().color(Color32::WHITE));
-                ui.add_space(4.0);
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("64-bit Up-to-date (Unlocked)").clicked() {
-                        self.apply_debug_preset(
-                            Some(SlsVariant::Moon64),
-                            ManifestChannel::SteamRt64,
-                            LockState::Unlocked,
-                            Some(true),
-                            Some(true),
-                            true,
-                            true,
-                        );
-                    }
-                    if ui.button("32-bit Legacy (Locked, Outdated)").clicked() {
-                        self.apply_debug_preset(
-                            Some(SlsVariant::Moon32),
-                            ManifestChannel::Ubuntu12,
-                            LockState::Locked,
-                            Some(false),
-                            Some(true),
-                            true,
-                            true,
-                        );
-                    }
-                    if ui.button("32-bit Legacy (Locked, Compat)").clicked() {
-                        self.apply_debug_preset(
-                            Some(SlsVariant::Moon32),
-                            ManifestChannel::Ubuntu12,
-                            LockState::Locked,
-                            Some(true),
-                            Some(true),
-                            true,
-                            true,
-                        );
-                    }
-                    if ui.button("Mismatch: steamrt64 + 32-bit SLS").clicked() {
-                        self.apply_debug_preset(
-                            Some(SlsVariant::Moon32),
-                            ManifestChannel::SteamRt64,
-                            LockState::Unlocked,
-                            Some(false),
-                            Some(false),
-                            true,
-                            true,
-                        );
-                    }
-                    if ui.button("Mismatch: ubuntu12 + 64-bit SLS").clicked() {
-                        self.apply_debug_preset(
-                            Some(SlsVariant::Moon64),
-                            ManifestChannel::Ubuntu12,
-                            LockState::Locked,
-                            Some(true),
-                            Some(false),
-                            true,
-                            true,
-                        );
-                    }
-                    if ui.button("Fresh / Nothing Installed").clicked() {
-                        self.apply_debug_preset(
-                            None,
-                            ManifestChannel::SteamRt64,
-                            LockState::Unlocked,
-                            Some(true),
-                            None,
-                            false,
-                            false,
-                        );
-                    }
-                });
-
-                ui.separator();
-                ui.label(RichText::new("Manual Overrides").strong().color(Color32::WHITE));
-                ui.add_space(4.0);
-
-                // Steam Client Channel & Lock
-                ui.horizontal(|ui| {
-                    ui.label("Client:");
-                    let is_rt64 = self.status.has_steamrt64_client();
-                    if ui.selectable_label(is_rt64, "steamrt64").clicked() {
-                        self.debug_sim_active = true;
-                        self.status.sim_has_rt64 = Some(true);
-                        self.status.sim_has_u12 = Some(false);
-                        if let Some(ref mut cv) = self.status.current_version {
-                            cv.channel = ManifestChannel::SteamRt64;
-                        }
-                    }
-                    if ui.selectable_label(!is_rt64, "ubuntu12").clicked() {
-                        self.debug_sim_active = true;
-                        self.status.sim_has_rt64 = Some(false);
-                        self.status.sim_has_u12 = Some(true);
-                        if let Some(ref mut cv) = self.status.current_version {
-                            cv.channel = ManifestChannel::Ubuntu12;
-                        }
-                    }
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Lock:");
-                    let locked = matches!(self.status.lock_state, LockState::Locked);
-                    let partial = matches!(self.status.lock_state, LockState::PartiallyLocked(_));
-                    let unlocked = matches!(self.status.lock_state, LockState::Unlocked);
-                    if ui.selectable_label(unlocked, "Unlocked").clicked() {
-                        self.debug_sim_active = true;
-                        self.status.lock_state = LockState::Unlocked;
-                    }
-                    if ui.selectable_label(locked, "Locked").clicked() {
-                        self.debug_sim_active = true;
-                        self.status.lock_state = LockState::Locked;
-                    }
-                    if ui.selectable_label(partial, "Partial").clicked() {
-                        self.debug_sim_active = true;
-                        self.status.lock_state =
-                            LockState::PartiallyLocked("Simulated partial lock".into());
-                    }
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("SLSsteam:");
-                    let v = self.status.lumen_versions.slssteam_variant;
-                    if ui.selectable_label(v.is_none(), "None").clicked() {
-                        self.debug_sim_active = true;
-                        self.status.lumen_versions.slssteam_installed = false;
-                        self.status.lumen_versions.slssteam_variant = None;
-                    }
-                    if ui.selectable_label(v == Some(SlsVariant::Moon32), "Moon32").clicked() {
-                        self.debug_sim_active = true;
-                        self.status.lumen_versions.slssteam_installed = true;
-                        self.status.lumen_versions.slssteam_variant = Some(SlsVariant::Moon32);
-                        self.status.lumen_versions.slsteam_moon = Some("v2.9".to_string());
-                    }
-                    if ui.selectable_label(v == Some(SlsVariant::Moon64), "Moon64").clicked() {
-                        self.debug_sim_active = true;
-                        self.status.lumen_versions.slssteam_installed = true;
-                        self.status.lumen_versions.slssteam_variant = Some(SlsVariant::Moon64);
-                        self.status.lumen_versions.slssteam_64_version = Some("v3.0".to_string());
-                    }
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Compat:");
-                    let cur = match &self.moon_status {
-                        Some(Ok(st)) => st.updated_for_latest_steam,
-                        _ => None,
-                    };
-                    if ui.selectable_label(cur == Some(true), "Compatible").clicked() {
-                        self.debug_sim_active = true;
-                        self.checking_moon = false;
-                        let active_v = self.status.active_sls_variant();
-                        let prev_pat = match &self.moon_status {
-                            Some(Ok(st)) => st.local_pattern_supported,
-                            _ => Some(true),
-                        };
-                        self.moon_status = Some(Ok(SlsMoonStatus {
-                            variant: active_v,
-                            monitor_timestamp_utc: 1794670000,
-                            monitor_display: "2026-11-14 16:20".to_string(),
-                            moon_display: "2026-11-14 16:20".to_string(),
-                            latest_moon_version: Some(match active_v {
-                                SlsVariant::Moon64 => "slssteam-moon-64 v3.0".to_string(),
-                                SlsVariant::Moon32 => "v2.9".to_string(),
-                            }),
-                            latest_steam_display: Some("2026-11-12 18:00".to_string()),
-                            updated_for_latest_steam: Some(true),
-                            local_pattern_supported: prev_pat,
-                            local_steamclient_sha: None,
-                        }));
-                    }
-                    if ui.selectable_label(cur == Some(false), "Incompatible").clicked() {
-                        self.debug_sim_active = true;
-                        self.checking_moon = false;
-                        let active_v = self.status.active_sls_variant();
-                        let prev_pat = match &self.moon_status {
-                            Some(Ok(st)) => st.local_pattern_supported,
-                            _ => Some(true),
-                        };
-                        self.moon_status = Some(Ok(SlsMoonStatus {
-                            variant: active_v,
-                            monitor_timestamp_utc: 1794000000,
-                            monitor_display: "2026-11-01 12:00".to_string(),
-                            moon_display: "2026-11-01 12:00".to_string(),
-                            latest_moon_version: Some(match active_v {
-                                SlsVariant::Moon64 => "slssteam-moon-64 v3.0".to_string(),
-                                SlsVariant::Moon32 => "v2.9".to_string(),
-                            }),
-                            latest_steam_display: Some("2026-11-12 18:00".to_string()),
-                            updated_for_latest_steam: Some(false),
-                            local_pattern_supported: prev_pat,
-                            local_steamclient_sha: None,
-                        }));
-                    }
-                    if ui
-                        .selectable_label(matches!(self.moon_status, Some(Err(_))), "Error")
-                        .clicked()
-                    {
-                        self.debug_sim_active = true;
-                        self.checking_moon = false;
-                        self.moon_status = Some(Err("Simulated network error".to_string()));
-                    }
-                });
-
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.dismiss_64_prompt, "Hide 64-bit migration banner");
-                });
-
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Reset to Real State").clicked() {
-                        self.debug_sim_active = false;
-                        self.dismiss_64_prompt = is_64bit_migration_dismissed();
-                        self.refresh_status();
-                        self.check_moon();
-                    }
-                    if ui.button("Close").clicked() {
-                        self.show_debug_menu = false;
-                    }
-                });
-            });
-        self.show_debug_menu = open;
     }
 
     fn render_home(&mut self, ui: &mut egui::Ui, t: &Texts) {
         let has_steam = self.status.steam_dir.is_some();
-        let active_variant = self.status.active_sls_variant();
-        let has_rt64 = self.status.has_steamrt64_client();
-        let has_u12 = self.status.has_ubuntu12_client();
-        let mismatch_msg = match self.status.lumen_versions.slssteam_variant {
-            Some(SlsVariant::Moon32) if has_steam && has_rt64 && !has_u12 => Some(t.mismatch_32_on_64),
-            Some(SlsVariant::Moon64) if has_steam && !has_rt64 && has_u12 => Some(t.mismatch_64_on_32),
-            _ => None,
-        };
+        let is_locked = self.status.lock_state.is_locked();
 
-        // 1. Compatibility Banner at top (with bold keywords)
-        let mut job = egui::text::LayoutJob::default();
-        let (banner_bg, banner_border) = if let Some(msg) = mismatch_msg {
-            let fmt = egui::TextFormat {
-                font_id: egui::FontId::proportional(13.5),
-                color: Color32::from_rgb(245, 210, 130),
-                ..Default::default()
-            };
-            job.append(msg, 0.0, fmt);
-            (Color32::from_rgb(58, 46, 24), Color32::from_rgb(138, 104, 42))
-        } else if self.checking_moon {
-            let fmt = egui::TextFormat {
-                font_id: egui::FontId::proportional(13.5),
-                color: Color32::LIGHT_GRAY,
-                ..Default::default()
-            };
-            job.append(t.banner_checking, 0.0, fmt);
-            (Color32::from_rgb(38, 44, 56), Color32::from_rgb(66, 80, 108))
-        } else {
-            match &self.moon_status {
-                Some(Ok(st)) => match st.updated_for_latest_steam {
-                    Some(true) => {
-                        let reg = egui::TextFormat {
-                            font_id: egui::FontId::proportional(13.5),
-                            color: Color32::from_rgb(150, 235, 175),
-                            ..Default::default()
-                        };
-                        let bold = egui::TextFormat {
-                            font_id: egui::FontId::new(
-                                13.5,
-                                egui::FontFamily::Name("fluent_bold".into()),
-                            ),
-                            color: Color32::from_rgb(205, 255, 220),
-                            ..Default::default()
-                        };
-                        let vname = st.variant.display_name();
-                        let ver = match st.latest_moon_version.as_deref() {
-                            Some(v) if v.to_ascii_lowercase().contains("moon") => v.to_string(),
-                            Some(v) => format!("{vname} {v}"),
-                            None => vname.to_string(),
-                        };
-                        if self.status.lock_state.is_locked() {
-                            job.append(t.banner_compat_p1, 0.0, reg.clone());
-                            job.append(&ver, 0.0, bold.clone());
-                            job.append(t.banner_compat_p2, 0.0, reg.clone());
-                            job.append(t.banner_compat_btn, 0.0, bold);
-                            job.append(t.banner_compat_p3, 0.0, reg);
-                        } else {
-                            job.append(t.banner_ok_p1, 0.0, reg.clone());
-                            job.append(&ver, 0.0, bold);
-                            job.append(t.banner_ok_p2, 0.0, reg);
-                        }
-                        (Color32::from_rgb(28, 56, 38), Color32::from_rgb(56, 128, 78))
-                    }
-                    Some(false) => {
-                        let reg = egui::TextFormat {
-                            font_id: egui::FontId::proportional(13.5),
-                            color: Color32::from_rgb(245, 210, 130),
-                            ..Default::default()
-                        };
-                        let bold = egui::TextFormat {
-                            font_id: egui::FontId::new(
-                                13.5,
-                                egui::FontFamily::Name("fluent_bold".into()),
-                            ),
-                            color: Color32::from_rgb(255, 238, 185),
-                            ..Default::default()
-                        };
-                        job.append(t.banner_incompat_p1, 0.0, reg.clone());
-                        job.append(st.variant.display_name(), 0.0, bold.clone());
-                        job.append(t.banner_incompat_p2, 0.0, reg.clone());
-                        job.append(t.banner_incompat_btn, 0.0, bold);
-                        job.append(t.banner_incompat_p3, 0.0, reg);
-                        (Color32::from_rgb(58, 46, 24), Color32::from_rgb(138, 104, 42))
-                    }
-                    None => {
-                        let fmt = egui::TextFormat {
-                            font_id: egui::FontId::proportional(13.5),
-                            color: Color32::LIGHT_GRAY,
-                            ..Default::default()
-                        };
-                        job.append(t.banner_checking, 0.0, fmt);
-                        (Color32::from_rgb(43, 43, 46), Color32::from_rgb(58, 58, 61))
-                    }
-                },
-                Some(Err(_)) => {
-                    let fmt = egui::TextFormat {
-                        font_id: egui::FontId::proportional(13.5),
-                        color: Color32::from_rgb(245, 160, 160),
-                        ..Default::default()
-                    };
-                    job.append(t.check_failed, 0.0, fmt);
-                    (Color32::from_rgb(58, 32, 32), Color32::from_rgb(128, 58, 58))
-                }
-                None => {
-                    let fmt = egui::TextFormat {
-                        font_id: egui::FontId::proportional(13.5),
-                        color: Color32::LIGHT_GRAY,
-                        ..Default::default()
-                    };
-                    job.append(t.banner_checking, 0.0, fmt);
-                    (Color32::from_rgb(43, 43, 46), Color32::from_rgb(58, 58, 61))
-                }
-            }
-        };
-
-        egui::Frame::none()
-            .fill(banner_bg)
-            .stroke(Stroke::new(1.0_f32, banner_border))
-            .rounding(Rounding::same(10.0))
-            .inner_margin(Margin::symmetric(14.0, 10.0))
+        egui::ScrollArea::vertical()
+            .id_salt("home_scroll")
+            .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    if self.checking_moon {
-                        ui.spinner();
-                    }
-                    ui.add(egui::Label::new(job).wrap());
-                });
-            });
-
-        ui.add_space(12.0);
-
-        // 1b. Contextual 64-bit migration banner for legacy 32-bit / ubuntu12 users
-        let show_64_migration = !self.dismiss_64_prompt
-            && has_steam
-            && mismatch_msg.is_none()
-            && (self.status.lumen_versions.slssteam_variant == Some(SlsVariant::Moon32)
-                || (has_u12 && !has_rt64));
-        if show_64_migration {
-            egui::Frame::none()
-                .fill(Color32::from_rgb(28, 44, 66))
-                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(64, 112, 172)))
-                .rounding(Rounding::same(10.0))
-                .inner_margin(Margin::symmetric(14.0, 10.0))
-                .show(ui, |ui| {
+                // 1. System Status Card
+        card_frame().show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new(t.migrate_64_title)
+                            RichText::new(t.system_status)
+                                .size(16.0)
                                 .strong()
-                                .size(13.5)
-                                .color(Color32::from_rgb(175, 215, 255)),
+                                .color(Color32::WHITE),
                         );
+                        ui.add_space(6.0);
+                        match &self.status.lock_state {
+                            LockState::Locked => pill_badge(
+                                ui,
+                                t.locked_pill,
+                                Color32::from_rgb(35, 77, 46),
+                                Color32::from_rgb(130, 230, 155),
+                            ),
+                            LockState::PartiallyLocked(_) => pill_badge(
+                                ui,
+                                t.partial_pill,
+                                Color32::from_rgb(90, 66, 24),
+                                Color32::from_rgb(250, 212, 120),
+                            ),
+                            LockState::Unlocked => pill_badge(
+                                ui,
+                                t.unlocked_pill,
+                                Color32::from_rgb(82, 36, 36),
+                                Color32::from_rgb(245, 150, 150),
+                            ),
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new("×").size(15.0).color(Color32::LIGHT_GRAY),
-                                    )
-                                    .frame(false),
-                                )
-                                .clicked()
-                            {
-                                self.dismiss_64_prompt = true;
-                                dismiss_64bit_migration();
+                            pill_badge(
+                                ui,
+                                &self.status.distro.name,
+                                Color32::from_rgb(48, 52, 60),
+                                Color32::from_rgb(200, 206, 216),
+                            );
+                            if self.status.distro.in_steamos_gaming_mode {
+                                pill_badge(
+                                    ui,
+                                    "Gaming Mode",
+                                    Color32::from_rgb(90, 66, 24),
+                                    Color32::from_rgb(250, 212, 120),
+                                );
+                            }
+                            if self.status.is_flatpak {
+                                pill_badge(
+                                    ui,
+                                    "Flatpak",
+                                    Color32::from_rgb(44, 58, 86),
+                                    Color32::LIGHT_BLUE,
+                                );
                             }
                         });
                     });
-                    ui.add_space(2.0);
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(t.migrate_64_desc)
-                                .size(12.5)
-                                .color(Color32::from_rgb(210, 225, 245)),
-                        )
-                        .wrap(),
-                    );
-                    ui.add_space(8.0);
-                    let btn = egui::Button::new(
-                        RichText::new(t.migrate_64_btn)
-                            .strong()
-                            .size(12.5)
-                            .color(Color32::WHITE),
-                    )
-                    .fill(Color32::from_rgb(42, 88, 142))
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(76, 136, 206)))
-                    .rounding(Rounding::same(6.0))
-                    .min_size(Vec2::new(0.0, 28.0));
-                    if ui.add_enabled(!self.busy, btn).clicked() {
-                        self.start_migrate_to_64();
-                    }
-                });
-            ui.add_space(12.0);
-        }
 
-        let is_locked = self.status.lock_state.is_locked();
-
-        // 2. Dual Primary Action Card (Mutually Exclusive: Rollback & Lock Steam vs Unlock & Update Steam)
-        card_frame().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.columns(2, |cols| {
-                // Left: Rollback & Lock Steam (enabled only when NOT locked)
-                cols[0].vertical(|ui| {
-                    let can_magic = has_steam && !self.busy && !is_locked;
-                    let magic_fill = if can_magic {
-                        Color32::from_rgb(42, 88, 142)
-                    } else {
-                        Color32::from_rgb(48, 50, 56)
-                    };
-                    let magic_stroke = if can_magic {
-                        Stroke::new(1.0_f32, Color32::from_rgb(76, 136, 206))
-                    } else {
-                        Stroke::new(1.0_f32, Color32::from_rgb(64, 66, 72))
-                    };
-                    let magic_btn = egui::Button::new("")
-                        .fill(magic_fill)
-                        .stroke(magic_stroke)
-                        .min_size(Vec2::new(ui.available_width(), 42.0));
-
-                    let resp = ui.add_enabled(can_magic, magic_btn);
-                    let font = egui::FontId::proportional(14.5);
-                    let fg = if can_magic {
-                        Color32::WHITE
-                    } else {
-                        Color32::from_rgb(130, 134, 140)
-                    };
-                    let galley = ui.fonts(|f| f.layout_no_wrap(t.magic_rollback.to_string(), font.clone(), fg));
-                    let icon_w = 20.0;
-                    let total_w = icon_w + galley.size().x;
-                    let start_x = resp.rect.center().x - total_w * 0.5;
-                    let sparkle_col = if can_magic {
-                        Color32::from_rgb(255, 215, 80)
-                    } else {
-                        Color32::from_rgb(150, 135, 85)
-                    };
-                    draw_sparkle(ui.painter(), start_x + 7.0, resp.rect.center().y, 7.5, 2.3, sparkle_col);
-                    ui.painter().galley(
-                        egui::pos2(start_x + icon_w, resp.rect.center().y - galley.size().y * 0.5),
-                        galley,
-                        fg,
-                    );
-                    if resp.clicked() {
-                        self.start_optimize();
-                    }
                     ui.add_space(6.0);
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(t.magic_desc)
-                                .small()
-                                .color(Color32::LIGHT_GRAY),
-                        )
-                        .wrap(),
-                    );
-                });
-
-                // Right: Unlock & Update Steam (enabled only when locked)
-                cols[1].vertical(|ui| {
-                    let can_unlock = has_steam && !self.busy && is_locked;
-                    let restore_fill = if can_unlock {
-                        Color32::from_rgb(38, 92, 66)
-                    } else {
-                        Color32::from_rgb(48, 50, 56)
-                    };
-                    let restore_stroke = if can_unlock {
-                        Stroke::new(1.0_f32, Color32::from_rgb(66, 146, 106))
-                    } else {
-                        Stroke::new(1.0_f32, Color32::from_rgb(64, 66, 72))
-                    };
-                    let restore_btn = egui::Button::new("")
-                        .fill(restore_fill)
-                        .stroke(restore_stroke)
-                        .min_size(Vec2::new(ui.available_width(), 42.0));
-
-                    let resp = ui.add_enabled(can_unlock, restore_btn);
-                    let font = egui::FontId::proportional(14.5);
-                    let fg = if can_unlock {
-                        Color32::WHITE
-                    } else {
-                        Color32::from_rgb(130, 134, 140)
-                    };
-                    let galley = ui.fonts(|f| {
-                        f.layout_no_wrap(t.unlock_and_update.to_string(), font.clone(), fg)
-                    });
-                    ui.painter().galley(
-                        egui::pos2(
-                            resp.rect.center().x - galley.size().x * 0.5,
-                            resp.rect.center().y - galley.size().y * 0.5,
+                    let steam_ver_text = match &self.status.current_version {
+                        Some(v) => format!(
+                            "{}  ({})  [{}]",
+                            v.version_id,
+                            v.formatted_date,
+                            v.channel.suffix()
                         ),
-                        galley,
-                        fg,
-                    );
-                    if resp.clicked() {
-                        self.start_unlock_and_update();
-                    }
-                    ui.add_space(6.0);
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(t.unlock_and_update_desc)
-                                .small()
-                                .color(Color32::LIGHT_GRAY),
-                        )
-                        .wrap(),
-                    );
+                        None => t.unknown_version.to_string(),
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(t.steam_client).color(Color32::LIGHT_GRAY));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(steam_ver_text);
+                        });
+                    });
                 });
-            });
 
-            if self.busy {
                 ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(RichText::new(t.working).strong());
-                    if let Some(last) = self.logs.last() {
-                        ui.label(RichText::new(format!("— {last}")).color(Color32::LIGHT_GRAY));
-                    }
-                });
-            }
-        });
 
-        ui.add_space(12.0);
-
-        // 3. System Status Card (aligned rows with separator lines, no Steam Path)
-        card_frame().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(t.system_status)
-                        .size(16.0)
-                        .strong()
-                        .color(Color32::WHITE),
-                );
-                ui.add_space(6.0);
-                match &self.status.lock_state {
-                    LockState::Locked => pill_badge(
-                        ui,
-                        t.locked_pill,
-                        Color32::from_rgb(35, 77, 46),
-                        Color32::from_rgb(130, 230, 155),
-                    ),
-                    LockState::PartiallyLocked(_) => pill_badge(
-                        ui,
-                        t.partial_pill,
-                        Color32::from_rgb(90, 66, 24),
-                        Color32::from_rgb(250, 212, 120),
-                    ),
-                    LockState::Unlocked => pill_badge(
-                        ui,
-                        t.unlocked_pill,
-                        Color32::from_rgb(82, 36, 36),
-                        Color32::from_rgb(245, 150, 150),
-                    ),
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    pill_badge(
-                        ui,
-                        &self.status.distro.name,
-                        Color32::from_rgb(48, 52, 60),
-                        Color32::from_rgb(200, 206, 216),
-                    );
-                    if self.status.distro.in_steamos_gaming_mode {
-                        pill_badge(
-                            ui,
-                            "Gaming Mode",
-                            Color32::from_rgb(90, 66, 24),
-                            Color32::from_rgb(250, 212, 120),
-                        );
-                    }
-                });
-            });
-
-            ui.add_space(8.0);
-            let row_sep = |ui: &mut egui::Ui| {
-                ui.add_space(4.0);
-                let rect = ui.available_rect_before_wrap();
-                ui.painter().hline(
-                    rect.left()..=rect.right(),
-                    rect.top(),
-                    Stroke::new(1.0_f32, Color32::from_rgb(53, 53, 57)),
-                );
-                ui.add_space(5.0);
-            };
-
-            row_sep(ui);
-
-            let green_bg = Color32::from_rgb(35, 77, 46);
-            let green_fg = Color32::from_rgb(130, 230, 155);
-
-            // Compute consistent column widths across all System Status rows
-            let row_h = 26.0;
-            let body_font = egui::FontId::proportional(14.0);
-            let small_font = egui::FontId::proportional(12.0);
-            let avail_w = ui.available_width();
-            let gap = 16.0;
-
-            let col1_w = ui.fonts(|f| {
-                [t.steam_client, active_variant.display_name(), "LuaTools", "Lumen"]
-                    .iter()
-                    .map(|s| f.layout_no_wrap((*s).to_string(), body_font.clone(), Color32::WHITE).size().x)
-                    .fold(0.0_f32, f32::max)
-            }) + 12.0;
-            let col2_w = 28.0;
-            let col4_w = ui.fonts(|f| {
-                [
-                    t.local_pattern_ok,
-                    t.local_pattern_missing,
-                    t.installed_pill,
-                    t.not_found_pill,
-                    "Flatpak",
-                ]
-                .iter()
-                .map(|s| f.layout_no_wrap((*s).to_string(), small_font.clone(), Color32::WHITE).size().x)
-                .fold(0.0_f32, f32::max)
-            }) + 24.0;
-            let col3_w = (avail_w - col1_w - col2_w - col4_w - gap * 3.0).max(80.0);
-
-            let draw_status_row = |ui: &mut egui::Ui,
-                                   name: &str,
-                                   link: Option<(&str, &str)>,
-                                   version: &str,
-                                   action_pill: Option<(&str, &str, bool)>,
-                                   badge: Option<(&str, Color32, Color32)>|
-             -> bool {
-                let mut action_clicked = false;
-                let (row_rect, _) =
-                    ui.allocate_exact_size(Vec2::new(avail_w, row_h), egui::Sense::hover());
-
-                let x0 = row_rect.left();
-                let x1 = x0 + col1_w + gap;
-                let x2 = x1 + col2_w + gap;
-                let x3 = x2 + col3_w + gap;
-
-                let rect1 = egui::Rect::from_min_size(egui::pos2(x0, row_rect.top()), Vec2::new(col1_w, row_h));
-                let rect2 = egui::Rect::from_min_size(egui::pos2(x1, row_rect.top()), Vec2::new(col2_w, row_h));
-                let rect3 = egui::Rect::from_min_size(egui::pos2(x2, row_rect.top()), Vec2::new(col3_w, row_h));
-                let rect4 = egui::Rect::from_min_size(egui::pos2(x3, row_rect.top()), Vec2::new(col4_w, row_h));
-
-                ui.allocate_new_ui(
-                    egui::UiBuilder::new()
-                        .max_rect(rect1)
-                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                    |ui| {
-                        ui.label(RichText::new(name).color(Color32::LIGHT_GRAY));
-                    },
-                );
-
-                ui.allocate_new_ui(
-                    egui::UiBuilder::new()
-                        .max_rect(rect2)
-                        .layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)),
-                    |ui| {
-                        if let Some((url, hover)) = link {
-                            external_link_btn(ui, url, hover);
-                        }
-                    },
-                );
-
-                ui.allocate_new_ui(
-                    egui::UiBuilder::new()
-                        .max_rect(rect3)
-                        .layout(egui::Layout::right_to_left(egui::Align::Center)),
-                    |ui| {
-                        ui.add(egui::Label::new(version).truncate());
-                        if let Some((pill_text, hover_text, enabled)) = action_pill {
-                            ui.add_space(8.0);
-                            let btn = egui::Button::new(
-                                RichText::new(pill_text)
-                                    .small()
-                                    .strong()
-                                    .color(Color32::from_rgb(255, 220, 140)),
-                            )
-                            .fill(Color32::from_rgb(82, 62, 28))
-                            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(168, 124, 52)))
-                            .rounding(Rounding::same(5.0))
-                            .min_size(Vec2::new(0.0, 20.0));
-                            let resp = ui
-                                .add_enabled(enabled, btn)
-                                .on_hover_text(hover_text)
-                                .on_hover_cursor(egui::CursorIcon::PointingHand);
-                            if resp.clicked() {
-                                action_clicked = true;
-                            }
-                        }
-                    },
-                );
-
-                ui.allocate_new_ui(
-                    egui::UiBuilder::new()
-                        .max_rect(rect4)
-                        .layout(egui::Layout::right_to_left(egui::Align::Center)),
-                    |ui| {
-                        if let Some((text, bg, fg)) = badge {
-                            pill_badge(ui, text, bg, fg);
-                        }
-                    },
-                );
-                action_clicked
-            };
-
-            // Row 1: Local Steam Client Version (label + full untruncated version on the right)
-            let steam_ver_text = match &self.status.current_version {
-                Some(v) => format!(
-                    "{}  ({})  [{}]",
-                    v.version_id,
-                    v.formatted_date,
-                    v.channel.suffix()
-                ),
-                None => t.unknown_version.to_string(),
-            };
-            ui.horizontal(|ui| {
-                ui.set_min_height(row_h);
-                ui.label(RichText::new(t.steam_client).color(Color32::LIGHT_GRAY));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.status.is_flatpak {
-                        pill_badge(
-                            ui,
-                            "Flatpak",
-                            Color32::from_rgb(44, 58, 86),
-                            Color32::LIGHT_BLUE,
-                        );
-                    }
-                    ui.label(steam_ver_text);
-                });
-            });
-
-            row_sep(ui);
-
-            // Row 2: slssteam-moon / slssteam-moon-64
-            let moon_ver = match active_variant {
-                SlsVariant::Moon64 => {
-                    if self.status.lumen_versions.slssteam_variant == Some(SlsVariant::Moon64) {
-                        self.status
-                            .lumen_versions
-                            .slssteam_64_version
-                            .as_deref()
-                            .unwrap_or("ELF64")
-                    } else {
-                        "—"
-                    }
-                }
-                SlsVariant::Moon32 => self
-                    .status
-                    .lumen_versions
-                    .slsteam_moon
-                    .as_deref()
-                    .unwrap_or("—"),
-            };
-            let moon_badge = if let Some(Ok(st)) = &self.moon_status {
-                match st.local_pattern_supported {
-                    Some(true) => Some((t.local_pattern_ok, green_bg, green_fg)),
-                    Some(false) => Some((
-                        t.local_pattern_missing,
-                        Color32::from_rgb(82, 36, 36),
-                        Color32::from_rgb(245, 150, 150),
-                    )),
-                    None if self.status.lumen_versions.slssteam_installed => {
-                        Some((t.installed_pill, green_bg, green_fg))
-                    }
-                    None => Some((t.not_found_pill, Color32::from_rgb(54, 54, 58), Color32::GRAY)),
-                }
-            } else if self.status.lumen_versions.slssteam_installed {
-                Some((t.installed_pill, green_bg, green_fg))
-            } else {
-                Some((t.not_found_pill, Color32::from_rgb(54, 54, 58), Color32::GRAY))
-            };
-            let moon_update_latest = self.moon_status.as_ref().and_then(|res| {
-                let st = res.as_ref().ok()?;
-                let latest = st.latest_moon_version.as_deref()?;
-                if is_moon_update_available(Some(moon_ver), Some(latest)) {
-                    Some(latest.to_string())
-                } else {
-                    None
-                }
-            });
-            let moon_update_hover = moon_update_latest
-                .as_deref()
-                .map(|v| format!("{} {v}", t.update_available_hover));
-            let moon_action_pill = moon_update_hover
-                .as_deref()
-                .map(|h| (t.update_available_pill, h, !self.busy));
-            if draw_status_row(
-                ui,
-                active_variant.display_name(),
-                Some((active_variant.repo_url(), t.open_repo_hover)),
-                moon_ver,
-                moon_action_pill,
-                moon_badge,
-            ) {
-                match active_variant {
-                    SlsVariant::Moon64 => {
-                        self.start_shell_tool("Updating slssteam-moon-64...", SLS64_INSTALL_CMD);
-                    }
-                    SlsVariant::Moon32 => {
-                        self.start_shell_tool(
-                            "Updating slssteam-moon (32-bit)...",
-                            SLS32_INSTALL_CMD,
-                        );
-                    }
-                }
-            }
-
-            row_sep(ui);
-
-            // Row 3: LuaTools
-            let luatools_ver = self
-                .status
-                .lumen_versions
-                .luatools
-                .as_deref()
-                .unwrap_or("—");
-            let luatools_badge = if self.status.lumen_versions.luatools.is_some()
-                || self.status.lumen_versions.luatools_installed
-            {
-                Some((t.installed_pill, green_bg, green_fg))
-            } else {
-                Some((t.not_found_pill, Color32::from_rgb(54, 54, 58), Color32::GRAY))
-            };
-            draw_status_row(
-                ui,
-                "LuaTools",
-                Some(("https://github.com/swwayps/luatools-moon", t.open_repo_hover)),
-                luatools_ver,
-                None,
-                luatools_badge,
-            );
-
-            row_sep(ui);
-
-            // Row 4: Lumen
-            let lumen_ver = self
-                .status
-                .lumen_versions
-                .lumen
-                .as_deref()
-                .unwrap_or("—");
-            let lumen_badge = if self.status.lumen_versions.lumen.is_some()
-                || self.status.lumen_versions.lumen_installed
-            {
-                Some((t.installed_pill, green_bg, green_fg))
-            } else {
-                Some((t.not_found_pill, Color32::from_rgb(54, 54, 58), Color32::GRAY))
-            };
-            draw_status_row(
-                ui,
-                "Lumen",
-                Some(("https://github.com/swwayps/luatools-moon", t.open_repo_hover)),
-                lumen_ver,
-                None,
-                lumen_badge,
-            );
-        });
-
-        ui.add_space(10.0);
-        let muted = Color32::from_rgb(135, 138, 145);
-        ui.vertical_centered(|ui| {
-            ui.label(
-                RichText::new(format!("v{CURRENT_VERSION}"))
-                    .size(11.5)
-                    .color(muted),
-            );
-            ui.horizontal(|ui| {
-                let approx_w = 138.0;
-                let pad = ((ui.available_width() - approx_w) * 0.5).max(0.0);
-                ui.add_space(pad);
-                ui.hyperlink_to(
-                    RichText::new("GitHub")
-                        .size(11.5)
-                        .color(Color32::from_rgb(145, 175, 220)),
-                    "https://github.com/foodiemonster/SteamRollbackr",
-                );
-                ui.label(
-                    RichText::new("•  by foodiemonster")
-                        .size(11.5)
-                        .color(muted),
-                );
-            });
-        });
-    }
-
-    fn render_advanced(&mut self, ui: &mut egui::Ui, t: &Texts) {
-        ui.label(
-            RichText::new(t.advanced_title)
-                .size(20.0)
-                .strong()
-                .color(Color32::WHITE),
-        );
-        ui.label(RichText::new(t.advanced_subtitle).color(Color32::LIGHT_GRAY));
-        ui.add_space(12.0);
-
-        // 1. Steam Path & Channel Card
-        card_frame().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-
-            // Steam Path Override Row
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(t.steam_path).strong().color(Color32::WHITE));
-                if self.status.steam_dir.is_none() {
-                    pill_badge(
-                        ui,
-                        t.steam_not_found,
-                        Color32::from_rgb(82, 36, 36),
-                        Color32::from_rgb(245, 150, 150),
-                    );
-                } else if self.steam_path_override.is_some() {
-                    pill_badge(
-                        ui,
-                        t.custom_pill,
-                        Color32::from_rgb(44, 58, 86),
-                        Color32::LIGHT_BLUE,
-                    );
-                } else {
-                    pill_badge(
-                        ui,
-                        t.auto_pill,
-                        Color32::from_rgb(35, 77, 46),
-                        Color32::from_rgb(130, 230, 155),
-                    );
-                }
-            });
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                let reset_w = 96.0;
-                let apply_w = 76.0;
-                let input_w = (ui.available_width() - reset_w - apply_w - 16.0).max(140.0);
-                let path_edit = egui::TextEdit::singleline(&mut self.steam_path_input)
-                    .hint_text("/path/to/Steam")
-                    .font(egui::TextStyle::Monospace)
-                    .desired_width(input_w);
-                let resp = ui.add_sized([input_w, 28.0], path_edit);
-
-                let trimmed = self.steam_path_input.trim();
-                let can_apply = !self.busy && !trimmed.is_empty();
-                let apply_btn = egui::Button::new(RichText::new(t.apply_btn).color(if can_apply {
-                    Color32::WHITE
-                } else {
-                    Color32::from_rgb(130, 134, 140)
-                }))
-                .fill(if can_apply {
-                    Color32::from_rgb(42, 88, 142)
-                } else {
-                    Color32::from_rgb(48, 50, 56)
-                })
-                .stroke(Stroke::new(
-                    1.0_f32,
-                    if can_apply {
-                        Color32::from_rgb(76, 136, 206)
-                    } else {
-                        Color32::from_rgb(64, 66, 72)
-                    },
-                ))
-                .min_size(Vec2::new(apply_w, 28.0));
-
-                let enter_pressed = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if ui.add_enabled(can_apply, apply_btn).clicked() || (enter_pressed && can_apply)
-                {
-                    self.steam_path_override = Some(PathBuf::from(trimmed));
-                    self.refresh_status();
-                    self.check_moon();
-                }
-
-                let can_reset = !self.busy && self.steam_path_override.is_some();
-                let reset_btn = egui::Button::new(t.reset_auto_btn)
-                    .fill(Color32::from_rgb(44, 45, 50))
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(68, 70, 76)))
-                    .min_size(Vec2::new(reset_w, 28.0));
-                if ui.add_enabled(can_reset, reset_btn).clicked() {
-                    self.steam_path_override = None;
-                    self.refresh_status();
-                    self.check_moon();
-                }
-            });
-
-            ui.add_space(8.0);
-            let sep_rect = ui.available_rect_before_wrap();
-            ui.painter().hline(
-                sep_rect.left()..=sep_rect.right(),
-                sep_rect.top(),
-                Stroke::new(1.0_f32, Color32::from_rgb(53, 53, 57)),
-            );
-            ui.add_space(10.0);
-
-            // Channel Selector Row
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(t.channel).strong().color(Color32::WHITE));
-                ui.add_space(6.0);
-                let mut changed = false;
-                for (ch, label) in [
-                    (ManifestChannel::SteamRt64, t.channel_steamrt64),
-                    (ManifestChannel::Ubuntu12, t.channel_ubuntu12),
-                ] {
-                    let active = self.channel == ch;
-                    let btn = egui::Button::new(RichText::new(label).color(if active {
-                        Color32::WHITE
-                    } else {
-                        Color32::LIGHT_GRAY
-                    }))
-                    .fill(if active {
-                        Color32::from_rgb(42, 88, 142)
-                    } else {
-                        Color32::from_rgb(44, 45, 50)
-                    })
-                    .stroke(Stroke::new(
-                        1.0_f32,
-                        if active {
-                            Color32::from_rgb(76, 136, 206)
-                        } else {
-                            Color32::from_rgb(64, 66, 72)
-                        },
-                    ))
-                    .min_size(Vec2::new(0.0, 28.0));
-                    if ui.add(btn).clicked() && !active {
-                        self.channel = ch;
-                        changed = true;
-                    }
-                }
-                if changed {
-                    self.load_releases(1, true);
-                }
-            });
-
-            ui.add_space(4.0);
-            let rec_msg = match self.status.current_version.as_ref().map(|v| v.channel) {
-                Some(ManifestChannel::Ubuntu12) => t.tip_ubuntu12_active,
-                _ => t.tip_steamrt64_rec,
-            };
-            ui.label(RichText::new(rec_msg).small().color(Color32::LIGHT_GRAY));
-        });
-
-        ui.add_space(12.0);
-
-        // 2. Available Releases Card (5 rows high)
-        let list_height = 175.0;
-        card_frame().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(t.available_releases)
-                        .size(15.0)
-                        .strong()
-                        .color(Color32::WHITE),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let reload_btn = egui::Button::new(t.reload_list)
-                        .fill(Color32::from_rgb(44, 45, 50))
-                        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(68, 70, 76)))
-                        .min_size(Vec2::new(0.0, 26.0));
-                    if ui
-                        .add_enabled(!self.loading_releases, reload_btn)
-                        .clicked()
-                    {
-                        self.load_releases(1, true);
-                    }
-                    ui.add_sized(
-                        [180.0, 26.0],
-                        egui::TextEdit::singleline(&mut self.filter_text)
-                            .hint_text(t.filter_hint),
-                    );
-                });
-            });
-
-            ui.add_space(8.0);
-                egui::ScrollArea::vertical()
-                .id_salt("release_list_scroll")
-                .max_height(list_height)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 5.0;
-                    let query = self.filter_text.to_lowercase();
-
-                    for (i, entry) in self.releases.iter().enumerate() {
-                        if !query.is_empty()
-                            && !entry.date_display.to_lowercase().contains(&query)
-                            && !entry.short_sha.to_lowercase().contains(&query)
-                            && !entry.message.to_lowercase().contains(&query)
-                        {
-                            continue;
-                        }
-                        let selected = self.selected_idx == Some(i);
-                        let short_title = if i == 0 {
-                            format!("{}   {}", entry.date_display, t.latest_badge)
-                        } else {
-                            entry.date_display.clone()
-                        };
-                        let hover_details = format!(
-                            "{}: {}\n{}: {}\n{}: {}\n{}: {}",
-                            t.date_label,
-                            entry.date_display,
-                            t.channel,
-                            entry.channel.suffix(),
-                            t.commit_sha_label,
-                            entry.sha,
-                            t.commit_msg_label,
-                            entry.message
-                        );
-
-                        ui.horizontal(|ui| {
-                            let info_w = 56.0;
-                            let btn_w = (ui.available_width() - info_w - 8.0).max(120.0);
-                            let row_btn = egui::Button::new(
-                                RichText::new(short_title).color(if selected {
-                                    Color32::WHITE
-                                } else {
-                                    Color32::LIGHT_GRAY
-                                }),
-                            )
-                            .fill(if selected {
-                                Color32::from_rgb(42, 88, 142)
-                            } else {
-                                Color32::from_rgb(38, 39, 43)
-                            })
-                            .stroke(Stroke::new(
-                                1.0_f32,
-                                if selected {
-                                    Color32::from_rgb(76, 136, 206)
-                                } else {
-                                    Color32::from_rgb(54, 55, 60)
-                                },
-                            ))
-                            .min_size(Vec2::new(btn_w, 30.0));
-                            if ui
-                                .add(row_btn)
-                                .on_hover_text(&hover_details)
-                                .clicked()
-                                && !self.busy
-                            {
-                                self.selected_idx = Some(i);
-                            }
-
-                            let info_btn = egui::Button::new(t.info_btn)
-                                .fill(Color32::from_rgb(44, 45, 50))
-                                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(64, 66, 72)))
-                                .min_size(Vec2::new(info_w, 30.0));
-                            if ui.add(info_btn).on_hover_text(t.info_hover).clicked() {
-                                self.details_entry = Some(entry.clone());
-                            }
-                        });
-                    }
-
-                    ui.add_space(4.0);
-                    if self.loading_releases {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label(t.loading_releases);
-                        });
-                    } else if self.has_more {
-                        let more_btn = egui::Button::new(t.load_older)
-                            .fill(Color32::from_rgb(44, 45, 50))
-                            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(68, 70, 76)))
-                            .min_size(Vec2::new(ui.available_width(), 28.0));
-                        if ui.add(more_btn).clicked() {
-                            let next_page = self.current_page + 1;
-                            self.load_releases(next_page, false);
-                        }
-                    }
-                });
-        });
-
-        ui.add_space(12.0);
-
-        // 3. Manual Action Buttons Card
-        card_frame().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            let has_steam = self.status.steam_dir.is_some();
-            let can_rollback = has_steam && self.selected_idx.is_some() && !self.busy;
-            let can_unlock = has_steam && !self.busy && self.status.lock_state.is_locked();
-            let can_lock = has_steam && !self.busy;
-
-            ui.columns(3, |cols| {
                 let fluent_btn = |ui: &mut egui::Ui,
                                   label: &str,
                                   enabled: bool,
@@ -2544,108 +1014,355 @@ impl SteamRollbackrApp {
                     resp
                 };
 
-                if fluent_btn(
-                    &mut cols[0],
-                    t.rollback_and_lock,
-                    can_rollback,
-                    Color32::from_rgb(42, 88, 142),
-                    Color32::from_rgb(76, 136, 206),
-                )
-                .clicked()
-                {
-                    self.start_rollback();
-                }
+                // 2. Rollback Steam Card
+        card_frame().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(
+                        RichText::new(t.rollback_section_title)
+                            .size(16.0)
+                            .strong()
+                            .color(Color32::WHITE),
+                    );
+                    ui.add_space(8.0);
 
-                if fluent_btn(
-                    &mut cols[1],
-                    t.unlock_updates,
-                    can_unlock,
-                    Color32::from_rgb(38, 92, 66),
-                    Color32::from_rgb(66, 146, 106),
-                )
-                .clicked()
-                {
-                    self.start_unlock();
-                }
+                    // 2a. Version Channel Selector
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(t.channel).strong().color(Color32::WHITE));
+                        ui.add_space(6.0);
+                        let mut changed_to = None;
+                        for (ch, label) in [
+                            (ManifestChannel::SteamRt64, t.channel_steamrt64),
+                            (ManifestChannel::Ubuntu12, t.channel_ubuntu12),
+                        ] {
+                            let active = self.selected_channel == Some(ch);
+                            let btn = egui::Button::new(RichText::new(label).color(if active {
+                                Color32::WHITE
+                            } else {
+                                Color32::LIGHT_GRAY
+                            }))
+                            .fill(if active {
+                                Color32::from_rgb(42, 88, 142)
+                            } else {
+                                Color32::from_rgb(44, 45, 50)
+                            })
+                            .stroke(Stroke::new(
+                                1.0_f32,
+                                if active {
+                                    Color32::from_rgb(76, 136, 206)
+                                } else {
+                                    Color32::from_rgb(64, 66, 72)
+                                },
+                            ))
+                            .min_size(Vec2::new(0.0, 28.0));
+                            if ui.add(btn).clicked() && !active {
+                                changed_to = Some(ch);
+                            }
+                        }
+                        if let Some(ch) = changed_to {
+                            self.selected_channel = Some(ch);
+                            self.channel = ch;
+                            self.load_releases(1, true);
+                        }
+                    });
 
-                if fluent_btn(
-                    &mut cols[2],
-                    t.lock_current,
-                    can_lock,
-                    Color32::from_rgb(58, 62, 72),
-                    Color32::from_rgb(92, 98, 112),
-                )
-                .clicked()
-                {
-                    self.start_lock_only();
-                }
-            });
+                    ui.add_space(4.0);
+                    let rec_msg = match self.status.current_version.as_ref().map(|v| v.channel) {
+                        Some(ManifestChannel::Ubuntu12) => t.tip_ubuntu12_active,
+                        _ => t.tip_steamrt64_rec,
+                    };
+                    ui.label(RichText::new(rec_msg).small().color(Color32::LIGHT_GRAY));
 
-            if self.busy {
+                    // 2b. Available Builds List (unrolls once a channel is selected)
+                    if self.selected_channel.is_some() {
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(t.available_releases)
+                                    .size(14.5)
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let reload_btn = egui::Button::new(t.reload_list)
+                                    .fill(Color32::from_rgb(44, 45, 50))
+                                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(68, 70, 76)))
+                                    .min_size(Vec2::new(0.0, 26.0));
+                                if ui
+                                    .add_enabled(!self.loading_releases, reload_btn)
+                                    .clicked()
+                                {
+                                    self.load_releases(1, true);
+                                }
+                                ui.add_sized(
+                                    [180.0, 26.0],
+                                    egui::TextEdit::singleline(&mut self.filter_text)
+                                        .hint_text(t.filter_hint),
+                                );
+                            });
+                        });
+
+                        ui.add_space(8.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt("release_list_scroll")
+                            .max_height(165.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 5.0;
+                                let query = self.filter_text.to_lowercase();
+
+                                for (i, entry) in self.releases.iter().enumerate() {
+                                    if !query.is_empty()
+                                        && !entry.date_display.to_lowercase().contains(&query)
+                                        && !entry.short_sha.to_lowercase().contains(&query)
+                                        && !entry.message.to_lowercase().contains(&query)
+                                    {
+                                        continue;
+                                    }
+                                    let selected = self.selected_idx == Some(i);
+                                    let short_title = if i == 0 {
+                                        format!("{}   {}", entry.date_display, t.latest_badge)
+                                    } else {
+                                        entry.date_display.clone()
+                                    };
+                                    let hover_details = format!(
+                                        "{}: {}\n{}: {}\n{}: {}\n{}: {}",
+                                        t.date_label,
+                                        entry.date_display,
+                                        t.channel,
+                                        entry.channel.suffix(),
+                                        t.commit_sha_label,
+                                        entry.sha,
+                                        t.commit_msg_label,
+                                        entry.message
+                                    );
+
+                                    ui.horizontal(|ui| {
+                                        let info_w = 56.0;
+                                        let btn_w = (ui.available_width() - info_w - 8.0).max(120.0);
+                                        let row_btn = egui::Button::new(
+                                            RichText::new(short_title).color(if selected {
+                                                Color32::WHITE
+                                            } else {
+                                                Color32::LIGHT_GRAY
+                                            }),
+                                        )
+                                        .fill(if selected {
+                                            Color32::from_rgb(42, 88, 142)
+                                        } else {
+                                            Color32::from_rgb(38, 39, 43)
+                                        })
+                                        .stroke(Stroke::new(
+                                            1.0_f32,
+                                            if selected {
+                                                Color32::from_rgb(76, 136, 206)
+                                            } else {
+                                                Color32::from_rgb(54, 55, 60)
+                                            },
+                                        ))
+                                        .min_size(Vec2::new(btn_w, 30.0));
+                                        if ui
+                                            .add(row_btn)
+                                            .on_hover_text(&hover_details)
+                                            .clicked()
+                                            && !self.busy
+                                        {
+                                            self.selected_idx = Some(i);
+                                        }
+
+                                        let info_btn = egui::Button::new(t.info_btn)
+                                            .fill(Color32::from_rgb(44, 45, 50))
+                                            .stroke(Stroke::new(
+                                                1.0_f32,
+                                                Color32::from_rgb(64, 66, 72),
+                                            ))
+                                            .min_size(Vec2::new(info_w, 30.0));
+                                        if ui.add(info_btn).on_hover_text(t.info_hover).clicked() {
+                                            self.details_entry = Some(entry.clone());
+                                        }
+                                    });
+                                }
+
+                                ui.add_space(4.0);
+                                if self.loading_releases {
+                                    ui.horizontal(|ui| {
+                                        ui.spinner();
+                                        ui.label(t.loading_releases);
+                                    });
+                                } else if self.has_more {
+                                    let more_btn = egui::Button::new(t.load_older)
+                                        .fill(Color32::from_rgb(44, 45, 50))
+                                        .stroke(Stroke::new(
+                                            1.0_f32,
+                                            Color32::from_rgb(68, 70, 76),
+                                        ))
+                                        .min_size(Vec2::new(ui.available_width(), 28.0));
+                                    if ui.add(more_btn).clicked() {
+                                        let next_page = self.current_page + 1;
+                                        self.load_releases(next_page, false);
+                                    }
+                                }
+                            });
+                    }
+
+                    ui.add_space(10.0);
+
+                    // 2c. Rollback & Lock to Selected Version | Lock Only
+                    let can_rollback = has_steam
+                        && self.selected_channel.is_some()
+                        && self.selected_idx.is_some()
+                        && !self.busy;
+                    let can_lock = has_steam && !self.busy;
+
+                    ui.columns(2, |cols| {
+                        cols[0].vertical(|ui| {
+                            if fluent_btn(
+                                ui,
+                                t.rollback_and_lock,
+                                can_rollback,
+                                Color32::from_rgb(42, 88, 142),
+                                Color32::from_rgb(76, 136, 206),
+                            )
+                            .clicked()
+                            {
+                                self.start_rollback();
+                            }
+                            ui.add_space(4.0);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(t.rollback_and_lock_desc)
+                                        .small()
+                                        .color(Color32::LIGHT_GRAY),
+                                )
+                                .wrap(),
+                            );
+                        });
+
+                        cols[1].vertical(|ui| {
+                            if fluent_btn(
+                                ui,
+                                t.lock_only,
+                                can_lock,
+                                Color32::from_rgb(58, 62, 72),
+                                Color32::from_rgb(92, 98, 112),
+                            )
+                            .clicked()
+                            {
+                                self.start_lock_only();
+                            }
+                            ui.add_space(4.0);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(t.lock_only_desc)
+                                        .small()
+                                        .color(Color32::LIGHT_GRAY),
+                                )
+                                .wrap(),
+                            );
+                        });
+                    });
+                });
+
                 ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(RichText::new(t.working).strong());
-                    if let Some(last) = self.logs.last() {
-                        ui.label(RichText::new(format!("— {last}")).color(Color32::LIGHT_GRAY));
+
+                // 3. Unlock Steam Card
+        card_frame().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(
+                        RichText::new(t.unlock_section_title)
+                            .size(16.0)
+                            .strong()
+                            .color(Color32::WHITE),
+                    );
+                    ui.add_space(8.0);
+
+                    let can_unlock = has_steam && !self.busy && is_locked;
+                    ui.columns(2, |cols| {
+                        cols[0].vertical(|ui| {
+                            if fluent_btn(
+                                ui,
+                                t.unlock_and_update,
+                                can_unlock,
+                                Color32::from_rgb(38, 92, 66),
+                                Color32::from_rgb(66, 146, 106),
+                            )
+                            .clicked()
+                            {
+                                self.start_unlock_and_update();
+                            }
+                            ui.add_space(4.0);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(t.unlock_and_update_desc)
+                                        .small()
+                                        .color(Color32::LIGHT_GRAY),
+                                )
+                                .wrap(),
+                            );
+                        });
+
+                        cols[1].vertical(|ui| {
+                            if fluent_btn(
+                                ui,
+                                t.unlock_updates,
+                                can_unlock,
+                                Color32::from_rgb(58, 62, 72),
+                                Color32::from_rgb(92, 98, 112),
+                            )
+                            .clicked()
+                            {
+                                self.start_unlock();
+                            }
+                            ui.add_space(4.0);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(t.unlock_only_desc)
+                                        .small()
+                                        .color(Color32::LIGHT_GRAY),
+                                )
+                                .wrap(),
+                            );
+                        });
+                    });
+
+                    if self.busy {
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(RichText::new(t.working).strong());
+                            if let Some(last) = self.logs.last() {
+                                ui.label(
+                                    RichText::new(format!("— {last}")).color(Color32::LIGHT_GRAY),
+                                );
+                            }
+                        });
                     }
                 });
-            }
-        });
-    }
 
-    fn render_tools_flyout_tip(&mut self, ctx: &egui::Context, t: &Texts) {
-        if !self.show_tools_tip {
-            return;
-        }
-        let Some(btn_rect) = self.tools_btn_rect else {
-            return;
-        };
-
-        let t_sec = ctx.input(|i| i.time);
-        let bounce = (t_sec * 4.5).sin().abs() as f32 * 8.0;
-        ctx.request_repaint_after(std::time::Duration::from_millis(16));
-
-        let anchor = egui::pos2(btn_rect.right() + 6.0 + bounce, btn_rect.center().y);
-        let bg = Color32::from_rgb(38, 105, 178);
-        let border = Color32::from_rgb(108, 178, 248);
-
-        egui::Area::new(egui::Id::new("tools_flyout_tip"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(egui::pos2(anchor.x + 8.0, anchor.y - 14.0))
-            .show(ctx, |ui| {
-                let arrow_tip = egui::pos2(anchor.x, anchor.y);
-                let painter = ui.painter();
-                painter.add(egui::Shape::convex_polygon(
-                    vec![
-                        arrow_tip,
-                        egui::pos2(anchor.x + 9.0, anchor.y - 6.0),
-                        egui::pos2(anchor.x + 9.0, anchor.y + 6.0),
-                    ],
-                    bg,
-                    egui::Stroke::new(1.0_f32, border),
-                ));
-
-                let resp = egui::Frame::none()
-                    .fill(bg)
-                    .stroke(egui::Stroke::new(1.0_f32, border))
-                    .rounding(Rounding::same(6.0))
-                    .inner_margin(Margin::symmetric(10.0, 5.0))
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new(t.new_tools_tooltip)
-                                .size(12.0)
-                                .strong()
-                                .color(Color32::WHITE),
+                ui.add_space(8.0);
+                let muted = Color32::from_rgb(135, 138, 145);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        RichText::new(format!("v{CURRENT_VERSION}"))
+                            .size(11.5)
+                            .color(muted),
+                    );
+                    ui.horizontal(|ui| {
+                        let approx_w = 138.0;
+                        let pad = ((ui.available_width() - approx_w) * 0.5).max(0.0);
+                        ui.add_space(pad);
+                        ui.hyperlink_to(
+                            RichText::new("GitHub")
+                                .size(11.5)
+                                .color(Color32::from_rgb(145, 175, 220)),
+                            "https://github.com/foodiemonster/SteamRollbackrLite",
                         );
-                    })
-                    .response
-                    .interact(egui::Sense::click());
-
-                if resp.clicked() {
-                    self.active_tab = ActiveTab::Tools;
-                    self.dismiss_tools_tip();
-                }
+                        ui.label(
+                            RichText::new("•  by foodiemonster")
+                                .size(11.5)
+                                .color(muted),
+                        );
+                    });
+                });
             });
     }
 
@@ -2665,14 +1382,6 @@ impl SteamRollbackrApp {
             .steam_dir
             .as_ref()
             .is_some_and(|d| d.join("ubuntu12_32/libcrypto.so.3").is_file());
-        let luatools_moon_present = self.status.lumen_versions.luatools_installed
-            || self.status.lumen_versions.luatools.is_some();
-        let luatools_fork = crate::steam::read_luatools_moon_fork();
-        let rafie_installed =
-            luatools_moon_present && luatools_fork.as_deref() == Some("rafie");
-        let swwayps_installed =
-            luatools_moon_present && matches!(luatools_fork.as_deref(), Some("swwayps") | None);
-        let luatools_linux_installed = is_luatools_linux_installed();
 
         let bold_font = egui::FontId::new(15.5, egui::FontFamily::Name("fluent_bold".into()));
         let green_bg = Color32::from_rgb(35, 77, 46);
@@ -2746,732 +1455,312 @@ impl SteamRollbackrApp {
             ui.add_space(10.0);
         }
 
-        let option_frame = |active: bool| {
-            egui::Frame::none()
-                .fill(Color32::from_rgb(44, 45, 50))
-                .stroke(Stroke::new(
-                    1.0_f32,
-                    if active {
-                        Color32::from_rgb(72, 148, 92)
-                    } else {
-                        Color32::from_rgb(64, 66, 72)
-                    },
-                ))
-                .rounding(Rounding::same(8.0))
-                .inner_margin(Margin::same(12.0))
-        };
-
-        egui::ScrollArea::vertical()
-            .id_salt("tools_scroll")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                // Row 1: Clean Reset & Reinstall (64-bit) | Full Uninstall (Vanilla Steam)
-                ui.columns(2, |cols| {
-                    let row1_desc_h = 92.0;
-                    card_frame().show(&mut cols[0], |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.label(
-                            RichText::new(t.clean_reset_64_title)
-                                .font(bold_font.clone())
-                                .color(Color32::WHITE),
-                        );
-                        ui.add_space(4.0);
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(ui.available_width(), row1_desc_h),
-                            egui::Layout::top_down(egui::Align::LEFT),
-                            |ui| {
-                                ui.set_min_height(row1_desc_h);
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(t.clean_reset_64_desc)
-                                            .size(12.5)
-                                            .color(Color32::LIGHT_GRAY),
-                                    )
-                                    .wrap(),
-                                );
-                            },
-                        );
-                        ui.add_space(8.0);
-                        if tool_btn(
-                            ui,
-                            t.clean_reset_64_btn,
-                            !self.busy && has_steam,
-                            Color32::from_rgb(42, 88, 142),
-                            Color32::from_rgb(76, 136, 206),
-                        )
-                        .clicked()
-                        {
-                            self.start_migrate_to_64();
-                        }
-                    });
-
-                    card_frame().show(&mut cols[1], |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.label(
-                            RichText::new(t.full_uninstall_title)
-                                .font(bold_font.clone())
-                                .color(Color32::WHITE),
-                        );
-                        ui.add_space(4.0);
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(ui.available_width(), row1_desc_h),
-                            egui::Layout::top_down(egui::Align::LEFT),
-                            |ui| {
-                                ui.set_min_height(row1_desc_h);
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(t.full_uninstall_desc)
-                                            .size(12.5)
-                                            .color(Color32::LIGHT_GRAY),
-                                    )
-                                    .wrap(),
-                                );
-                            },
-                        );
-                        ui.add_space(8.0);
-                        if tool_btn(
-                            ui,
-                            t.full_uninstall_btn,
-                            !self.busy && has_steam,
-                            Color32::from_rgb(122, 40, 40),
-                            Color32::from_rgb(184, 72, 72),
-                        )
-                        .clicked()
-                        {
-                            self.start_full_uninstall();
-                        }
-                    });
-                });
-
-                ui.add_space(10.0);
-
-                // Row 2: SLSsteam Variant Switcher (single container, 2-column row)
-                let installed_variant = self.status.lumen_versions.slssteam_variant;
-                let has_rt64_client = self.status.has_steamrt64_client();
-                let sls64_active = installed_variant == Some(SlsVariant::Moon64);
-                let sls32_active = installed_variant == Some(SlsVariant::Moon32);
-                let sls64_cmd = SLS64_INSTALL_CMD;
-                let sls32_cmd = SLS32_INSTALL_CMD;
-
-                card_frame().show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(t.sls_section_title)
-                                .font(bold_font.clone())
-                                .color(Color32::WHITE),
-                        );
-                        ui.add_space(6.0);
-                        if sls64_active {
-                            pill_badge(ui, "64-bit", green_bg, green_fg);
-                        } else if sls32_active {
-                            pill_badge(ui, "32-bit", green_bg, green_fg);
-                        } else {
-                            pill_badge(
-                                ui,
-                                t.not_found_pill,
-                                Color32::from_rgb(54, 54, 58),
-                                Color32::GRAY,
-                            );
-                        }
-                    });
-                    ui.add_space(4.0);
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(t.sls_section_desc).color(Color32::LIGHT_GRAY),
-                        )
-                        .wrap(),
-                    );
-                    ui.add_space(10.0);
-
-                    ui.columns(2, |cols| {
-                        let sls_desc_h = if has_rt64_client { 92.0 } else { 130.0 };
-                        // Left: slssteam-moon-64
-                        option_frame(sls64_active).show(&mut cols[0], |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(t.sls_64_title)
-                                        .strong()
-                                        .color(Color32::WHITE),
-                                )
-                                .wrap(),
-                            );
-                            ui.add_space(4.0);
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(ui.available_width(), 22.0),
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    ui.set_min_height(22.0);
-                                    if has_rt64_client {
-                                        pill_badge(
-                                            ui,
-                                            t.recommended_pill,
-                                            Color32::from_rgb(38, 72, 118),
-                                            Color32::from_rgb(135, 195, 255),
-                                        );
-                                    }
-                                    if sls64_active {
-                                        pill_badge(ui, t.active_pill, green_bg, green_fg);
-                                    }
-                                },
-                            );
-                            ui.add_space(4.0);
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(ui.available_width(), sls_desc_h),
-                                egui::Layout::top_down(egui::Align::LEFT),
-                                |ui| {
-                                    ui.set_min_height(sls_desc_h);
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(t.sls_64_desc)
-                                                .size(12.5)
-                                                .color(Color32::LIGHT_GRAY),
-                                        )
-                                        .wrap(),
-                                    );
-                                    if !has_rt64_client {
-                                        ui.add_space(4.0);
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(t.sls_64_requires_rt64)
-                                                    .size(12.0)
-                                                    .color(Color32::from_rgb(245, 200, 110)),
-                                            )
-                                            .wrap(),
-                                        );
-                                    }
-                                },
-                            );
-                            ui.add_space(8.0);
-                            if !has_rt64_client {
-                                if tool_btn(
-                                    ui,
-                                    t.migrate_64_tools_btn,
-                                    !self.busy && has_steam,
-                                    Color32::from_rgb(42, 88, 142),
-                                    Color32::from_rgb(76, 136, 206),
-                                )
-                                .clicked()
-                                {
-                                    self.start_migrate_to_64();
-                                }
-                            } else {
-                                let btn_label = if sls64_active {
-                                    t.reinstall_btn
-                                } else if sls32_active {
-                                    t.switch_btn
-                                } else {
-                                    t.install_btn
-                                };
-                                let (fill, stroke) = if sls64_active {
-                                    (Color32::from_rgb(56, 60, 68), Color32::from_rgb(92, 96, 108))
-                                } else {
-                                    (Color32::from_rgb(42, 88, 142), Color32::from_rgb(76, 136, 206))
-                                };
-                                if tool_btn(ui, btn_label, !self.busy, fill, stroke).clicked() {
-                                    self.start_shell_tool(
-                                        "Installing slssteam-moon-64...",
-                                        sls64_cmd,
-                                    );
-                                }
-                            }
-                        });
-
-                        // Right: slssteam-moon (32-bit)
-                        option_frame(sls32_active).show(&mut cols[1], |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(t.sls_32_title)
-                                        .strong()
-                                        .color(Color32::WHITE),
-                                )
-                                .wrap(),
-                            );
-                            ui.add_space(4.0);
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(ui.available_width(), 22.0),
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    ui.set_min_height(22.0);
-                                    if sls32_active {
-                                        pill_badge(ui, t.active_pill, green_bg, green_fg);
-                                    }
-                                },
-                            );
-                            ui.add_space(4.0);
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(ui.available_width(), sls_desc_h),
-                                egui::Layout::top_down(egui::Align::LEFT),
-                                |ui| {
-                                    ui.set_min_height(sls_desc_h);
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(t.sls_32_desc)
-                                                .size(12.5)
-                                                .color(Color32::LIGHT_GRAY),
-                                        )
-                                        .wrap(),
-                                    );
-                                },
-                            );
-                            ui.add_space(8.0);
-                            let btn_label = if sls32_active {
-                                t.reinstall_btn
-                            } else if sls64_active {
-                                t.switch_btn
-                            } else {
-                                t.install_btn
-                            };
-                            let (fill, stroke) = if sls32_active {
-                                (Color32::from_rgb(56, 60, 68), Color32::from_rgb(92, 96, 108))
-                            } else {
-                                (Color32::from_rgb(42, 88, 142), Color32::from_rgb(76, 136, 206))
-                            };
-                            if tool_btn(ui, btn_label, !self.busy, fill, stroke).clicked() {
-                                self.start_shell_tool(
-                                    "Installing slssteam-moon (32-bit)...",
-                                    sls32_cmd,
-                                );
-                            }
-                        });
-                    });
-                });
-
-                ui.add_space(10.0);
-
-                // Row 3: Unified LuaTools Switcher (single container, 2-column row + standalone below)
-                let any_luatools = rafie_installed || swwayps_installed || luatools_linux_installed;
-                card_frame().show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(t.luatools_section_title)
-                                .font(bold_font.clone())
-                                .color(Color32::WHITE),
-                        );
-                        ui.add_space(6.0);
-                        if any_luatools {
-                            pill_badge(ui, t.active_pill, green_bg, green_fg);
-                        } else {
-                            pill_badge(
-                                ui,
-                                t.not_found_pill,
-                                Color32::from_rgb(54, 54, 58),
-                                Color32::GRAY,
-                            );
-                        }
-                    });
-                    ui.add_space(4.0);
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(t.luatools_section_desc).color(Color32::LIGHT_GRAY),
-                        )
-                        .wrap(),
-                    );
-                    ui.add_space(10.0);
-
-                    let preserve_64_suffix = if self.status.active_sls_variant()
-                        == SlsVariant::Moon64
-                        && has_rt64_client
-                    {
-                        format!(" && {sls64_cmd}")
-                    } else {
-                        String::new()
-                    };
-
-                    ui.columns(2, |cols| {
-                        let lt_desc_h = 74.0;
-                        // Left: Rafie-kun / luatools-moon (Recommended)
-                        option_frame(rafie_installed).show(&mut cols[0], |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(t.luatools_rafie_title)
-                                        .strong()
-                                        .color(Color32::WHITE),
-                                )
-                                .wrap(),
-                            );
-                            ui.add_space(4.0);
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(ui.available_width(), 22.0),
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    ui.set_min_height(22.0);
-                                    pill_badge(
-                                        ui,
-                                        t.recommended_pill,
-                                        Color32::from_rgb(38, 72, 118),
-                                        Color32::from_rgb(135, 195, 255),
-                                    );
-                                    if rafie_installed {
-                                        pill_badge(ui, t.active_pill, green_bg, green_fg);
-                                    }
-                                },
-                            );
-                            ui.add_space(4.0);
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(ui.available_width(), lt_desc_h),
-                                egui::Layout::top_down(egui::Align::LEFT),
-                                |ui| {
-                                    ui.set_min_height(lt_desc_h);
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(t.luatools_rafie_desc)
-                                                .size(12.5)
-                                                .color(Color32::LIGHT_GRAY),
-                                        )
-                                        .wrap(),
-                                    );
-                                },
-                            );
-                            ui.add_space(8.0);
-                            if rafie_installed {
-                                ui.columns(2, |bcols| {
-                                    if tool_btn(
-                                        &mut bcols[0],
-                                        t.reinstall_btn,
-                                        !self.busy,
-                                        Color32::from_rgb(56, 60, 68),
-                                        Color32::from_rgb(92, 96, 108),
-                                    )
-                                    .clicked()
-                                    {
-                                        let cmd = format!(
-                                            "curl -fsSL https://raw.githubusercontent.com/Rafie-kun/luatools-moon/main/install.sh | bash && mkdir -p \"$HOME/.cache/steamrollbackr\" && printf rafie > \"$HOME/.cache/steamrollbackr/luatools_moon_fork\"{preserve_64_suffix}"
-                                        );
-                                        self.start_shell_tool(
-                                            "Reinstalling LuaTools (Rafie-kun)...",
-                                            &cmd,
-                                        );
-                                    }
-                                    if tool_btn(
-                                        &mut bcols[1],
-                                        t.uninstall_btn,
-                                        !self.busy,
-                                        Color32::from_rgb(122, 40, 40),
-                                        Color32::from_rgb(184, 72, 72),
-                                    )
-                                    .clicked()
-                                    {
-                                        self.start_shell_tool(
-                                            "Uninstalling LuaTools (Rafie-kun)...",
-                                            "curl -fsSL https://raw.githubusercontent.com/Rafie-kun/luatools-moon/main/uninstall.sh | bash; rm -f \"$HOME/.cache/steamrollbackr/luatools_moon_fork\"",
-                                        );
-                                    }
-                                });
-                            } else {
-                                let btn_label = if swwayps_installed {
-                                    t.switch_btn
-                                } else {
-                                    t.install_btn
-                                };
-                                if tool_btn(
-                                    ui,
-                                    btn_label,
-                                    !self.busy,
-                                    Color32::from_rgb(42, 88, 142),
-                                    Color32::from_rgb(76, 136, 206),
-                                )
-                                .clicked()
-                                {
-                                    let cmd = format!(
-                                        "curl -fsSL https://raw.githubusercontent.com/Rafie-kun/luatools-moon/main/install.sh | bash && mkdir -p \"$HOME/.cache/steamrollbackr\" && printf rafie > \"$HOME/.cache/steamrollbackr/luatools_moon_fork\"{preserve_64_suffix}"
-                                    );
-                                    self.start_shell_tool(
-                                        "Installing LuaTools (Rafie-kun)...",
-                                        &cmd,
-                                    );
-                                }
-                            }
-                        });
-
-                        // Right: swwayps / luatools-moon
-                        option_frame(swwayps_installed).show(&mut cols[1], |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(t.luatools_moon_title)
-                                        .strong()
-                                        .color(Color32::WHITE),
-                                )
-                                .wrap(),
-                            );
-                            ui.add_space(4.0);
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(ui.available_width(), 22.0),
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    ui.set_min_height(22.0);
-                                    if swwayps_installed {
-                                        pill_badge(ui, t.active_pill, green_bg, green_fg);
-                                    }
-                                },
-                            );
-                            ui.add_space(4.0);
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(ui.available_width(), lt_desc_h),
-                                egui::Layout::top_down(egui::Align::LEFT),
-                                |ui| {
-                                    ui.set_min_height(lt_desc_h);
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(t.luatools_moon_desc)
-                                                .size(12.5)
-                                                .color(Color32::LIGHT_GRAY),
-                                        )
-                                        .wrap(),
-                                    );
-                                },
-                            );
-                            ui.add_space(8.0);
-                            if swwayps_installed {
-                                ui.columns(2, |bcols| {
-                                    if tool_btn(
-                                        &mut bcols[0],
-                                        t.reinstall_btn,
-                                        !self.busy,
-                                        Color32::from_rgb(56, 60, 68),
-                                        Color32::from_rgb(92, 96, 108),
-                                    )
-                                    .clicked()
-                                    {
-                                        let cmd = format!(
-                                            "curl -fsSL https://raw.githubusercontent.com/swwayps/luatools-moon/main/install.sh | bash && mkdir -p \"$HOME/.cache/steamrollbackr\" && printf swwayps > \"$HOME/.cache/steamrollbackr/luatools_moon_fork\"{preserve_64_suffix}"
-                                        );
-                                        self.start_shell_tool(
-                                            "Reinstalling LuaTools (swwayps)...",
-                                            &cmd,
-                                        );
-                                    }
-                                    if tool_btn(
-                                        &mut bcols[1],
-                                        t.uninstall_btn,
-                                        !self.busy,
-                                        Color32::from_rgb(122, 40, 40),
-                                        Color32::from_rgb(184, 72, 72),
-                                    )
-                                    .clicked()
-                                    {
-                                        self.start_shell_tool(
-                                            "Uninstalling LuaTools (swwayps)...",
-                                            "curl -fsSL https://raw.githubusercontent.com/swwayps/luatools-moon/main/uninstall.sh | bash; rm -f \"$HOME/.cache/steamrollbackr/luatools_moon_fork\"",
-                                        );
-                                    }
-                                });
-                            } else {
-                                let btn_label = if rafie_installed {
-                                    t.switch_btn
-                                } else {
-                                    t.install_btn
-                                };
-                                if tool_btn(
-                                    ui,
-                                    btn_label,
-                                    !self.busy,
-                                    Color32::from_rgb(42, 88, 142),
-                                    Color32::from_rgb(76, 136, 206),
-                                )
-                                .clicked()
-                                {
-                                    let cmd = format!(
-                                        "curl -fsSL https://raw.githubusercontent.com/swwayps/luatools-moon/main/install.sh | bash && mkdir -p \"$HOME/.cache/steamrollbackr\" && printf swwayps > \"$HOME/.cache/steamrollbackr/luatools_moon_fork\"{preserve_64_suffix}"
-                                    );
-                                    self.start_shell_tool(
-                                        "Installing LuaTools (swwayps)...",
-                                        &cmd,
-                                    );
-                                }
-                            }
-                        });
-                    });
-
-                    ui.add_space(8.0);
-
-                    // Option C: mrpinkguy / luatools-linux (standalone)
-                    option_frame(luatools_linux_installed).show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(t.luatools_linux_title)
-                                    .strong()
-                                    .color(Color32::WHITE),
-                            );
-                            if luatools_linux_installed {
-                                ui.add_space(4.0);
-                                pill_badge(ui, t.active_pill, green_bg, green_fg);
-                            }
-                        });
-                        ui.add_space(4.0);
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(t.luatools_linux_desc)
-                                    .size(12.5)
-                                    .color(Color32::LIGHT_GRAY),
-                            )
-                            .wrap(),
-                        );
-                        ui.add_space(8.0);
-                        if luatools_linux_installed {
-                            ui.columns(3, |cols| {
-                                if tool_btn(
-                                    &mut cols[0],
-                                    t.reinstall_btn,
-                                    !self.busy,
-                                    Color32::from_rgb(56, 60, 68),
-                                    Color32::from_rgb(92, 96, 108),
-                                )
-                                .clicked()
-                                {
-                                    self.start_shell_tool(
-                                        "Reinstalling LuaTools (mrpinkguy)...",
-                                        "curl -fsSL https://gitlab.com/mrpinkguyjp/luatools-linux/-/raw/main/scripts/install.sh | sh",
-                                    );
-                                }
-                                if tool_btn(
-                                    &mut cols[1],
-                                    t.uninstall_btn,
-                                    !self.busy,
-                                    Color32::from_rgb(122, 40, 40),
-                                    Color32::from_rgb(184, 72, 72),
-                                )
-                                .clicked()
-                                {
-                                    self.start_shell_tool(
-                                        "Uninstalling LuaTools (mrpinkguy, keeping settings)...",
-                                        "curl -fsSL https://gitlab.com/mrpinkguyjp/luatools-linux/-/raw/main/scripts/install.sh | sh -s -- --uninstall",
-                                    );
-                                }
-                                if tool_btn(
-                                    &mut cols[2],
-                                    t.uninstall_purge_btn,
-                                    !self.busy,
-                                    Color32::from_rgb(142, 32, 32),
-                                    Color32::from_rgb(206, 68, 68),
-                                )
-                                .clicked()
-                                {
-                                    self.start_shell_tool(
-                                        "Uninstalling and purging LuaTools (mrpinkguy)...",
-                                        "curl -fsSL https://gitlab.com/mrpinkguyjp/luatools-linux/-/raw/main/scripts/install.sh | sh -s -- --uninstall --purge",
-                                    );
-                                }
-                            });
-                        } else if tool_btn(
-                            ui,
-                            t.install_btn,
-                            !self.busy,
-                            Color32::from_rgb(42, 88, 142),
-                            Color32::from_rgb(76, 136, 206),
-                        )
-                        .clicked()
-                        {
-                            self.start_shell_tool(
-                                "Installing LuaTools (mrpinkguy)...",
-                                "curl -fsSL https://gitlab.com/mrpinkguyjp/luatools-linux/-/raw/main/scripts/install.sh | sh",
-                            );
-                        }
-                    });
-                });
-
-                ui.add_space(10.0);
-
-                // Row 4 (Bottom): 32-bit libcrypto.so.3
-                card_frame().show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(t.libcrypto_title)
-                                .font(bold_font.clone())
-                                .color(Color32::WHITE),
-                        );
-                        ui.add_space(6.0);
-                        if libcrypto_installed {
-                            pill_badge(ui, t.installed_pill, green_bg, green_fg);
-                        } else {
-                            pill_badge(ui, t.missing_pill, red_bg, red_fg);
-                        }
-                    });
-                    ui.add_space(6.0);
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(t.libcrypto_desc).color(Color32::LIGHT_GRAY),
-                        )
-                        .wrap(),
-                    );
-                    ui.add_space(10.0);
-                    ui.columns(2, |cols| {
-                        let can_install = has_steam && !self.busy && !libcrypto_installed;
-                        let can_uninstall = has_steam && !self.busy && libcrypto_installed;
-                        if tool_btn(
-                            &mut cols[0],
-                            t.install_btn,
-                            can_install,
-                            Color32::from_rgb(42, 88, 142),
-                            Color32::from_rgb(76, 136, 206),
-                        )
-                        .clicked()
-                        {
-                            self.start_install_libcrypto3();
-                        }
-                        if tool_btn(
-                            &mut cols[1],
-                            t.uninstall_btn,
-                            can_uninstall,
-                            Color32::from_rgb(122, 40, 40),
-                            Color32::from_rgb(184, 72, 72),
-                        )
-                        .clicked()
-                        {
-                            self.start_uninstall_libcrypto3();
-                        }
-                    });
-                });
+        card_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(t.libcrypto_title)
+                        .font(bold_font.clone())
+                        .color(Color32::WHITE),
+                );
+                ui.add_space(6.0);
+                if libcrypto_installed {
+                    pill_badge(ui, t.installed_pill, green_bg, green_fg);
+                } else {
+                    pill_badge(ui, t.missing_pill, red_bg, red_fg);
+                }
             });
+            ui.add_space(6.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(t.libcrypto_desc).color(Color32::LIGHT_GRAY),
+                )
+                .wrap(),
+            );
+            ui.add_space(10.0);
+            ui.columns(2, |cols| {
+                let can_install = has_steam && !self.busy && !libcrypto_installed;
+                let can_uninstall = has_steam && !self.busy && libcrypto_installed;
+                if tool_btn(
+                    &mut cols[0],
+                    t.install_btn,
+                    can_install,
+                    Color32::from_rgb(42, 88, 142),
+                    Color32::from_rgb(76, 136, 206),
+                )
+                .clicked()
+                {
+                    self.start_install_libcrypto3();
+                }
+                if tool_btn(
+                    &mut cols[1],
+                    t.uninstall_btn,
+                    can_uninstall,
+                    Color32::from_rgb(122, 40, 40),
+                    Color32::from_rgb(184, 72, 72),
+                )
+                .clicked()
+                {
+                    self.start_uninstall_libcrypto3();
+                }
+            });
+        });
     }
 
-    fn render_troubleshooting(&self, ui: &mut egui::Ui, t: &Texts) {
+    fn render_options(&mut self, ui: &mut egui::Ui, t: &Texts) {
         ui.label(
-            RichText::new(t.troubleshooting_title)
+            RichText::new(t.options_title)
                 .size(20.0)
                 .strong()
                 .color(Color32::WHITE),
         );
-        ui.label(RichText::new(t.troubleshooting_subtitle).color(Color32::LIGHT_GRAY));
+        ui.label(RichText::new(t.options_subtitle).color(Color32::LIGHT_GRAY));
         ui.add_space(12.0);
 
+        let install_kind = detect_install_kind();
+        let is_system_pkg = install_kind == InstallKind::SystemPackage;
+        let is_user_installed = is_app_installed_user_local();
+
+        let bold_font = egui::FontId::new(15.5, egui::FontFamily::Name("fluent_bold".into()));
+        let green_bg = Color32::from_rgb(35, 77, 46);
+        let green_fg = Color32::from_rgb(130, 230, 155);
+        let blue_bg = Color32::from_rgb(44, 58, 86);
+
+        let opt_btn = |ui: &mut egui::Ui,
+                       label: &str,
+                       enabled: bool,
+                       fill: Color32,
+                       stroke: Color32|
+         -> egui::Response {
+            let fg = if enabled {
+                Color32::WHITE
+            } else {
+                Color32::from_rgb(130, 134, 140)
+            };
+            let btn = egui::Button::new("")
+                .fill(if enabled {
+                    fill
+                } else {
+                    Color32::from_rgb(48, 50, 56)
+                })
+                .stroke(Stroke::new(
+                    1.0_f32,
+                    if enabled {
+                        stroke
+                    } else {
+                        Color32::from_rgb(64, 66, 72)
+                    },
+                ))
+                .min_size(Vec2::new(ui.available_width(), 34.0));
+            let resp = ui.add_enabled(enabled, btn);
+            let galley = ui.fonts(|f| {
+                f.layout_no_wrap(label.to_string(), egui::FontId::proportional(14.0), fg)
+            });
+            ui.painter().galley(
+                egui::pos2(
+                    resp.rect.center().x - galley.size().x * 0.5,
+                    resp.rect.center().y - galley.size().y * 0.5,
+                ),
+                galley,
+                fg,
+            );
+            resp
+        };
+
+        if self.busy {
+            egui::Frame::none()
+                .fill(Color32::from_rgb(36, 52, 74))
+                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(76, 136, 206)))
+                .rounding(Rounding::same(8.0))
+                .inner_margin(Margin::symmetric(12.0, 8.0))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new(t.working).strong().color(Color32::WHITE));
+                        if let Some(last) = self.logs.last() {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!("— {last}"))
+                                        .color(Color32::from_rgb(200, 220, 245)),
+                                )
+                                .truncate(),
+                            );
+                        }
+                    });
+                });
+            ui.add_space(10.0);
+        }
+
+        // 1. Steam Path Card
+        card_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(t.steam_path)
+                        .font(bold_font.clone())
+                        .color(Color32::WHITE),
+                );
+                ui.add_space(6.0);
+                if self.status.steam_dir.is_none() {
+                    pill_badge(
+                        ui,
+                        t.steam_not_found,
+                        Color32::from_rgb(82, 36, 36),
+                        Color32::from_rgb(245, 150, 150),
+                    );
+                } else if self.steam_path_override.is_some() {
+                    pill_badge(ui, t.custom_pill, blue_bg, Color32::LIGHT_BLUE);
+                } else {
+                    pill_badge(ui, t.auto_pill, green_bg, green_fg);
+                }
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let reset_w = 96.0;
+                let apply_w = 76.0;
+                let input_w = (ui.available_width() - reset_w - apply_w - 16.0).max(140.0);
+                let path_edit = egui::TextEdit::singleline(&mut self.steam_path_input)
+                    .hint_text("/path/to/Steam")
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(input_w);
+                let resp = ui.add_sized([input_w, 28.0], path_edit);
+
+                let trimmed = self.steam_path_input.trim();
+                let can_apply = !self.busy && !trimmed.is_empty();
+                let apply_btn =
+                    egui::Button::new(RichText::new(t.apply_btn).color(if can_apply {
+                        Color32::WHITE
+                    } else {
+                        Color32::from_rgb(130, 134, 140)
+                    }))
+                    .fill(if can_apply {
+                        Color32::from_rgb(42, 88, 142)
+                    } else {
+                        Color32::from_rgb(48, 50, 56)
+                    })
+                    .stroke(Stroke::new(
+                        1.0_f32,
+                        if can_apply {
+                            Color32::from_rgb(76, 136, 206)
+                        } else {
+                            Color32::from_rgb(64, 66, 72)
+                        },
+                    ))
+                    .min_size(Vec2::new(apply_w, 28.0));
+
+                let enter_pressed =
+                    resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.add_enabled(can_apply, apply_btn).clicked() || (enter_pressed && can_apply) {
+                    self.steam_path_override = Some(PathBuf::from(trimmed));
+                    self.refresh_status();
+                }
+
+                let can_reset = !self.busy && self.steam_path_override.is_some();
+                let reset_btn = egui::Button::new(t.reset_auto_btn)
+                    .fill(Color32::from_rgb(44, 45, 50))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(68, 70, 76)))
+                    .min_size(Vec2::new(reset_w, 28.0));
+                if ui.add_enabled(can_reset, reset_btn).clicked() {
+                    self.steam_path_override = None;
+                    self.refresh_status();
+                }
+            });
+        });
+
+        ui.add_space(10.0);
+
+        // 2. Install SteamRollbackrLite Card
+        card_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(t.app_install_title)
+                        .font(bold_font)
+                        .color(Color32::WHITE),
+                );
+                ui.add_space(6.0);
+                if is_system_pkg {
+                    pill_badge(ui, t.system_pkg_pill, green_bg, green_fg);
+                } else if is_user_installed {
+                    pill_badge(ui, t.installed_pill, green_bg, green_fg);
+                } else {
+                    pill_badge(ui, t.portable_pill, blue_bg, Color32::LIGHT_BLUE);
+                }
+            });
+            ui.add_space(6.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(t.app_install_desc).color(Color32::LIGHT_GRAY),
+                )
+                .wrap(),
+            );
+            ui.add_space(10.0);
+            ui.columns(2, |cols| {
+                let can_install = !self.busy && !is_system_pkg;
+                let can_uninstall = !self.busy && !is_system_pkg && is_user_installed;
+                if opt_btn(
+                    &mut cols[0],
+                    t.install_btn,
+                    can_install,
+                    Color32::from_rgb(42, 88, 142),
+                    Color32::from_rgb(76, 136, 206),
+                )
+                .clicked()
+                {
+                    self.start_install_app_user_local();
+                }
+                if opt_btn(
+                    &mut cols[1],
+                    t.uninstall_btn,
+                    can_uninstall,
+                    Color32::from_rgb(122, 40, 40),
+                    Color32::from_rgb(184, 72, 72),
+                )
+                .clicked()
+                {
+                    self.start_uninstall_app_user_local();
+                }
+            });
+        });
+    }
+
+    fn render_how_to_use(&self, ui: &mut egui::Ui, t: &Texts) {
+        ui.label(
+            RichText::new(t.how_to_use_title)
+                .size(20.0)
+                .strong()
+                .color(Color32::WHITE),
+        );
+        ui.label(RichText::new(t.how_to_use_subtitle).color(Color32::LIGHT_GRAY));
+        ui.add_space(12.0);
+
+        let bold_font = egui::FontId::new(14.5, egui::FontFamily::Name("fluent_bold".into()));
+
         egui::ScrollArea::vertical()
-            .id_salt("troubleshooting_scroll")
+            .id_salt("how_to_use_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let faqs = [
-                    (t.faq_q1, t.faq_a1),
-                    (t.faq_q2, t.faq_a2),
-                    (t.faq_q3, t.faq_a3),
-                    (t.faq_q4, t.faq_a4),
+                let steps = [
+                    (t.step1_title, t.step1_desc),
+                    (t.step2_title, t.step2_desc),
+                    (t.step3_title, t.step3_desc),
+                    (t.step4_title, t.step4_desc),
+                    (t.step5_title, t.step5_desc),
                 ];
-                for (idx, (q, a)) in faqs.iter().enumerate() {
+                for (title, desc) in steps {
                     card_frame().show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        egui::CollapsingHeader::new(
-                            RichText::new(*q)
-                                .font(egui::FontId::new(
-                                    14.5,
-                                    egui::FontFamily::Name("fluent_bold".into()),
-                                ))
+                        ui.label(
+                            RichText::new(title)
+                                .font(bold_font.clone())
                                 .color(Color32::WHITE),
-                        )
-                        .id_salt(("faq_item", idx))
-                        .default_open(idx == 0)
-                        .show(ui, |ui| {
-                            ui.add_space(4.0);
-                            ui.add(
-                                egui::Label::new(RichText::new(*a).color(Color32::LIGHT_GRAY))
-                                    .wrap(),
-                            );
-                        });
+                        );
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Label::new(RichText::new(desc).color(Color32::LIGHT_GRAY))
+                                .wrap(),
+                        );
                     });
                     ui.add_space(8.0);
                 }
@@ -3512,23 +1801,16 @@ impl SteamRollbackrApp {
     }
 }
 
-impl eframe::App for SteamRollbackrApp {
+impl eframe::App for SteamRollbackrLiteApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if ctx.input(|i| {
-            i.key_pressed(egui::Key::F12)
-                || (i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::D))
-        }) {
-            self.show_debug_menu = !self.show_debug_menu;
-        }
         self.poll_events();
-        if self.busy || self.loading_releases || self.checking_moon {
+        if self.busy || self.loading_releases {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
         let t = texts(self.lang);
 
         self.render_sidebar(ctx, &t);
-        self.render_tools_flyout_tip(ctx, &t);
 
         egui::CentralPanel::default()
             .frame(
@@ -3538,15 +1820,11 @@ impl eframe::App for SteamRollbackrApp {
             )
             .show(ctx, |ui| match self.active_tab {
                 ActiveTab::Home => self.render_home(ui, &t),
-                ActiveTab::Advanced => self.render_advanced(ui, &t),
                 ActiveTab::Tools => self.render_tools(ui, &t),
-                ActiveTab::Troubleshooting => self.render_troubleshooting(ui, &t),
+                ActiveTab::Options => self.render_options(ui, &t),
+                ActiveTab::HowToUse => self.render_how_to_use(ui, &t),
                 ActiveTab::Logs => self.render_logs(ctx, ui, &t),
             });
-
-        if self.show_debug_menu {
-            self.render_debug_menu(ctx);
-        }
 
         if let Some(entry) = self.details_entry.clone() {
             let mut open = true;
@@ -3579,55 +1857,6 @@ impl eframe::App for SteamRollbackrApp {
                 });
             if !open {
                 self.details_entry = None;
-            }
-        }
-
-        if self.confirm_restart {
-            let mut open = true;
-            egui::Window::new(t.restart_confirm_title)
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-                .show(ctx, |ui| {
-                    let popup_w = 310.0;
-                    ui.set_width(popup_w);
-                    ui.add_space(4.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(RichText::new(t.restart_confirm_msg).color(Color32::WHITE));
-                    });
-                    ui.add_space(12.0);
-                    let side_margin = 6.0;
-                    let gap = 8.0;
-                    let btn_w = (popup_w - side_margin * 2.0 - gap) * 0.5;
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 0.0;
-                        ui.add_space(side_margin);
-                        let yes_btn =
-                            egui::Button::new(RichText::new(t.yes_btn).color(Color32::WHITE))
-                                .fill(Color32::from_rgb(38, 92, 66))
-                                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(66, 146, 106)))
-                                .min_size(Vec2::new(btn_w, 32.0));
-                        if ui.add(yes_btn).clicked() {
-                            self.confirm_restart = false;
-                            self.start_restart_steam();
-                        }
-
-                        ui.add_space(gap);
-
-                        let no_btn =
-                            egui::Button::new(RichText::new(t.no_btn).color(Color32::WHITE))
-                                .fill(Color32::from_rgb(122, 40, 40))
-                                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(184, 72, 72)))
-                                .min_size(Vec2::new(btn_w, 32.0));
-                        if ui.add(no_btn).clicked() {
-                            self.confirm_restart = false;
-                        }
-                    });
-                    ui.add_space(4.0);
-                });
-            if !open {
-                self.confirm_restart = false;
             }
         }
 

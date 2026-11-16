@@ -1,13 +1,13 @@
 [package]
-name = "steam-rollbackr"
-version = "0.6.7"
+name = "steam-rollbackr-lite"
+version = "0.1.0"
 edition = "2021"
 description = "Cross-distro Linux GUI utility to roll back the Steam client and lock/unlock updates"
 license = "MIT"
-repository = "https://github.com/foodiemonster/SteamRollbackr"
+repository = "https://github.com/foodiemonster/SteamRollbackrLite"
 
 [[bin]]
-name = "steamrollbackr"
+name = "steamrollbackr-lite"
 path = "src/main.rs"
 
 [dependencies]
