@@ -476,129 +476,18 @@ pub fn unlock_and_update_steam(steam_dir: &Path, log: &mut dyn FnMut(&str)) -> R
     Ok(())
 }
 
-/// Returns the ELF class (`1` = 32-bit, `2` = 64-bit) if `path` starts with `\x7fELF`.
-pub fn elf_class(path: &Path) -> Option<u8> {
-    use std::io::Read;
-    let mut f = fs::File::open(path).ok()?;
-    let mut hdr = [0u8; 5];
-    f.read_exact(&mut hdr).ok()?;
-    if &hdr[..4] == b"\x7fELF" {
-        Some(hdr[4])
-    } else {
-        None
-    }
-}
+const BUNDLED_LIBCRYPTO3: &[u8] = include_bytes!("../assets/libcrypto.so.3");
 
-/// Checks whether a file begins with a 32-bit ELF header (`EI_CLASS == 1`).
-fn is_elf32(path: &Path) -> bool {
-    elf_class(path) == Some(1)
-}
-
-fn find_i386_libcrypto(dir: &Path) -> Option<PathBuf> {
-    let entries = fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if let Some(found) = find_i386_libcrypto(&path) {
-                return Some(found);
-            }
-        } else if path.file_name().and_then(|n| n.to_str()) == Some("libcrypto.so.3")
-            && path
-                .parent()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                == Some("i386-linux-gnu")
-            && is_elf32(&path)
-        {
-            return Some(path);
-        }
-    }
-    None
-}
-
-/// Parses library folder paths from Steam's `libraryfolders.vdf`.
-fn parse_library_folders(content: &str) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    for line in content.lines() {
-        let mut tokens = line.split('"');
-        let _before = tokens.next();
-        let Some(key) = tokens.next() else { continue };
-        let _between = tokens.next();
-        let Some(val) = tokens.next() else { continue };
-        if key == "path" && !val.trim().is_empty() {
-            let p = PathBuf::from(val.trim());
-            if !dirs.contains(&p) {
-                dirs.push(p);
-            }
-        }
-    }
-    dirs
-}
-
-/// Collects `<library>/steamapps/common` directories from the primary Steam dir and `libraryfolders.vdf`.
-fn collect_steam_common_dirs(steam_dir: &Path) -> Vec<PathBuf> {
-    let mut common_dirs = vec![steam_dir.join("steamapps/common")];
-    for vdf_rel in ["steamapps/libraryfolders.vdf", "config/libraryfolders.vdf"] {
-        let vdf_path = steam_dir.join(vdf_rel);
-        if let Ok(content) = fs::read_to_string(&vdf_path) {
-            for lib in parse_library_folders(&content) {
-                let common = lib.join("steamapps/common");
-                if !common_dirs.contains(&common) {
-                    common_dirs.push(common);
-                }
-            }
-        }
-    }
-    common_dirs
-}
-
-/// Copies 32-bit libcrypto.so.3 from SteamLinuxRuntime or host 32-bit OpenSSL into ubuntu12_32/ and sets +x.
+/// Installs the bundled 32-bit libcrypto.so.3 into ubuntu12_32/ and marks it executable.
 pub fn install_libcrypto3(steam_dir: &Path, log: &mut dyn FnMut(&str)) -> Result<(), String> {
-    let common_dirs = collect_steam_common_dirs(steam_dir);
-    let mut found = None;
-    for common_dir in &common_dirs {
-        if !common_dir.is_dir() {
-            continue;
-        }
-        log(&format!(
-            "Searching {} for i386-linux-gnu/libcrypto.so.3...",
-            common_dir.display()
-        ));
-        if let Some(src) = find_i386_libcrypto(common_dir) {
-            found = Some(src);
-            break;
-        }
-    }
-
-    if found.is_none() {
-        let host_candidates = [
-            "/usr/lib32/libcrypto.so.3",
-            "/usr/lib/i386-linux-gnu/libcrypto.so.3",
-            "/usr/lib/libcrypto.so.3",
-        ];
-        for cand in host_candidates {
-            let p = Path::new(cand);
-            if p.is_file() && is_elf32(p) {
-                log(&format!("Found 32-bit system libcrypto.so.3 at {cand}"));
-                found = Some(p.to_path_buf());
-                break;
-            }
-        }
-    }
-
-    let src = found.ok_or_else(|| {
-        "Could not find 32-bit libcrypto.so.3 in any Steam library folder or host 32-bit library directory. Install \"Steam Linux Runtime\" in Steam or 32-bit OpenSSL (e.g. lib32-openssl / libssl3:i386 / openssl-libs.i686).".to_string()
-    })?;
-    log(&format!("Found: {}", src.display()));
-
     let dest_dir = steam_dir.join("ubuntu12_32");
     fs::create_dir_all(&dest_dir)
         .map_err(|e| format!("Failed to create {}: {e}", dest_dir.display()))?;
     let dest = dest_dir.join("libcrypto.so.3");
 
-    fs::copy(&src, &dest)
-        .map_err(|e| format!("Failed to copy to {}: {e}", dest.display()))?;
-    log(&format!("Copied to {}", dest.display()));
+    fs::write(&dest, BUNDLED_LIBCRYPTO3)
+        .map_err(|e| format!("Failed to write {}: {e}", dest.display()))?;
+    log(&format!("Installed bundled 32-bit libcrypto.so.3 to {}", dest.display()));
 
     let mut perms = fs::metadata(&dest)
         .map_err(|e| format!("Failed to read permissions on {}: {e}", dest.display()))?
@@ -768,33 +657,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_library_folders() {
-        let vdf = r#"
-"libraryfolders"
-{
-	"0"
-	{
-		"path"		"/home/user/.local/share/Steam"
-		"label"		""
-	}
-	"1"
-	{
-		"path"		"/run/media/mmcblk0p1/SteamLibrary"
-		"label"		"SDCard"
-	}
-}
-"#;
-        let libs = parse_library_folders(vdf);
-        assert_eq!(
-            libs,
-            vec![
-                PathBuf::from("/home/user/.local/share/Steam"),
-                PathBuf::from("/run/media/mmcblk0p1/SteamLibrary"),
-            ]
-        );
-    }
-
-    #[test]
     fn test_parse_os_release() {
         let sample = "NAME=\"Arch Linux\"\nPRETTY_NAME=\"Arch Linux\"\nID=arch\n";
         assert_eq!(
@@ -841,13 +703,8 @@ mod tests {
     }
 
     #[test]
-    fn test_is_elf32() {
-        let tmp = std::env::temp_dir().join(format!("steamrollbackr-lite_elf_{}", std::process::id()));
-        fs::write(&tmp, [0x7F, b'E', b'L', b'F', 1, 1, 1, 0]).unwrap();
-        assert!(is_elf32(&tmp));
-        fs::write(&tmp, [0x7F, b'E', b'L', b'F', 2, 1, 1, 0]).unwrap();
-        assert!(!is_elf32(&tmp));
-        let _ = fs::remove_file(&tmp);
+    fn test_bundled_libcrypto3_is_elf32() {
+        assert!(BUNDLED_LIBCRYPTO3.starts_with(&[0x7F, b'E', b'L', b'F', 1]));
     }
 }
 

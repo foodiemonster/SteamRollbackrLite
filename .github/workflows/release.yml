@@ -26,7 +26,7 @@ jobs:
             VER="${GITHUB_REF_NAME#v}"
             sed -i "s/^version = .*/version = \"${VER}\"/" Cargo.toml
           else
-            VER="0.1.0"
+            VER="0.1.5"
           fi
           echo "version=$VER" >> "$GITHUB_OUTPUT"
 

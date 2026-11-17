@@ -1,7 +1,5 @@
-# SteamRollbackrLite v0.1.0
+# SteamRollbackrLite v0.1.5
 
 ## What's New
 
-### Lite Edition
-- **Focused Rollback & Lock Workflow**: Streamlined **Home** view to select a Steam channel (`steamrt64` 64-bit or `ubuntu12` 32-bit), pick a specific Steam release, **Rollback & Lock Updates**, **Lock Current Version**, **Unlock Only**, or **Unlock & Update Steam** back to the latest official client.
-- **Focused Tools Tab**: Simplified **Tools** section containing only 32-bit `libcrypto.so.3` installation and removal.
+- **Bundled 32-bit `libcrypto.so.3`**: Embedded 32-bit `libcrypto.so.3` directly inside SteamRollbackrLite so installation works out of the box in all package formats without requiring Steam Linux Runtime or host 32-bit OpenSSL packages.
